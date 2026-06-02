@@ -1,0 +1,8 @@
+@import './fonts.css';
+@import './tailwind.css';
+@import './theme.css';
+
+/* Force default page scale in Chromium-based browsers */
+html {
+  zoom: 0.8;
+}

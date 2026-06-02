@@ -1,0 +1,9 @@
+.pytest_cache
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+.venv
+data
+frontend/node_modules
+frontend/.vite

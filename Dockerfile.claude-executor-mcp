@@ -1,0 +1,37 @@
+FROM claude-executor:local
+
+USER root
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        docker.io \
+        docker-compose \
+        git \
+        openssh-client \
+        python3 \
+        python3-venv \
+    && rm -rf /var/lib/apt/lists/* \
+    && mv /usr/bin/docker /usr/bin/docker-real
+
+RUN printf '%s\n' \
+    '#!/bin/sh' \
+    'if [ "$1" = "compose" ]; then' \
+    '  shift' \
+    '  exec docker-compose "$@"' \
+    'fi' \
+    'exec /usr/bin/docker-real "$@"' \
+    > /usr/bin/docker \
+    && chmod 755 /usr/bin/docker \
+    && curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/usr/local/bin sh \
+    && uvx --version \
+    && npm install -g @anthropic-ai/claude-code@2.1.153 \
+    && npm install -g @colbymchenry/codegraph \
+    && claude --version \
+    && codegraph --version
+
+COPY tools/claude-executor-entrypoint.sh /usr/local/bin/claude-executor-entrypoint
+RUN chmod 755 /usr/local/bin/claude-executor-entrypoint
+
+USER node
