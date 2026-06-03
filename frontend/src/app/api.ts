@@ -101,6 +101,12 @@ function actionKind(value?: string): Action['kind'] {
     'workspace_diff',
     'create_memory',
     'create_skill',
+    'host_browser_list',
+    'host_browser_open',
+    'host_browser_open_current',
+    'host_browser_launch',
+    'host_browser_facebook_research',
+    'host_browser_screenshot',
     'note',
     'git_checkpoint',
     'git_restore_checkpoint',
@@ -117,6 +123,9 @@ function actionSummary(action: BackendJob['pending_actions'][number]): string {
 }
 
 function actionLogs(job: BackendJob, action: BackendJob['pending_actions'][number]): string[] {
+  if ((action.kind || '') === 'host_browser_facebook_research') {
+    return [];
+  }
   const includePreview = (action.kind || '') !== 'coding_agent_executor';
   const rows = [
     includePreview ? action.preview : '',
@@ -186,6 +195,43 @@ function parseVerificationFromText(text: string): { hardGateOk?: boolean; missin
   return { hardGateOk, missingRequirements };
 }
 
+function parseFacebookResearchResult(raw?: string): Action['facebookResearch'] | undefined {
+  if (!raw) return undefined;
+  try {
+    const parsed = JSON.parse(raw);
+    const data = parsed?.result ?? parsed?.data;
+    if (!data || typeof data !== 'object') return undefined;
+    const summary = typeof data.summary === 'object' && data.summary ? data.summary : {};
+    const results = Array.isArray(data.results) ? data.results : [];
+    if (!results.length) return undefined;
+    const recentConfirmed = Number((summary as any).recent_confirmed_count || 0);
+    const timeUnknown = Number((summary as any).time_unknown_count || 0);
+    const staleConfirmed = Number((summary as any).stale_confirmed_count || 0);
+    const parts: string[] = [];
+    if (recentConfirmed) parts.push(`${recentConfirmed} bài xác nhận còn mới`);
+    if (staleConfirmed) parts.push(`${staleConfirmed} bài xác nhận quá cũ`);
+    return {
+      summaryText: parts.join(', '),
+      counts: {
+        recentConfirmed,
+        timeUnknown,
+        staleConfirmed,
+      },
+      items: results.slice(0, 10).map((item: any, index: number) => ({
+        rank: Number(item.rank || index + 1),
+        author: String(item.author || `Bài ${index + 1}`),
+        summary: String(item.summary || ''),
+        keepReason: String(item.keep_reason || item.llm_reason || ''),
+        timeStatus: String(item.time_status || item.time_bucket || ''),
+        url: String(item.url || ''),
+        rawUrl: String(item.raw_url || ''),
+      })),
+    };
+  } catch {
+    return undefined;
+  }
+}
+
 function planProgress(job: BackendJob): { completed: number; runningDetail: string } {
   const planLen = job.plan?.length || 0;
   if (!planLen) return { completed: 0, runningDetail: '' };
@@ -207,6 +253,9 @@ export function mapJobToActions(job: BackendJob | null): Action[] {
     result: action.result || action.error,
     logs: actionLogs(job, action),
     timestamp: asDate(action.updated_at || action.created_at),
+    facebookResearch: actionKind(action.kind) === 'host_browser_facebook_research'
+      ? parseFacebookResearchResult(String(action.result || ''))
+      : undefined,
   }));
 
   if (job.plan?.length && ['draft', 'planned', 'approved', 'running', 'done', 'failed'].includes(job.status || '')) {
@@ -327,16 +376,23 @@ export function mapJobToMessages(job: BackendJob): Message[] {
   }
 
   const actions = mapJobToActions(job);
-  const hasActiveActions = actions.some(action => action.status === 'running' || action.status === 'pending');
+  const activeActions = actions.filter(action => action.status === 'running' || action.status === 'pending');
+  const completedFacebookActions = actions.filter(
+    action =>
+      action.kind === 'host_browser_facebook_research'
+      && action.status === 'done'
+      && Boolean(action.facebookResearch?.items?.length),
+  );
+  const hasActiveActions = activeActions.length > 0;
 
   // Attach active actions to the latest assistant message instead of creating
   // a separate "Action timeline" message.
-  if (actions.length && hasActiveActions) {
+  if (hasActiveActions) {
     const lastIndex = messages.length - 1;
     if (lastIndex >= 0 && messages[lastIndex].role === 'assistant') {
       messages[lastIndex] = {
         ...messages[lastIndex],
-        actions,
+        actions: activeActions,
       };
     } else {
       messages.push({
@@ -344,7 +400,34 @@ export function mapJobToMessages(job: BackendJob): Message[] {
         role: 'assistant',
         content: '',
         timestamp: asDate(job.updated_at || job.created_at),
-        actions,
+        actions: activeActions,
+      });
+    }
+  }
+
+  if (completedFacebookActions.length > 0) {
+    const latestFacebookAction = completedFacebookActions[completedFacebookActions.length - 1];
+    const lastAssistantIndex = [...messages]
+      .map((message, index) => ({ message, index }))
+      .reverse()
+      .find(({ message }) => message.role === 'assistant')?.index ?? -1;
+
+    if (lastAssistantIndex >= 0) {
+      const existingActions = messages[lastAssistantIndex].actions || [];
+      const alreadyAttached = existingActions.some(action => action.id === latestFacebookAction.id);
+      if (!alreadyAttached) {
+        messages[lastAssistantIndex] = {
+          ...messages[lastAssistantIndex],
+          actions: [...existingActions, latestFacebookAction],
+        };
+      }
+    } else {
+      messages.push({
+        id: `facebook-result-inline-${job.id}`,
+        role: 'assistant',
+        content: '',
+        timestamp: asDate(job.updated_at || job.created_at),
+        actions: [latestFacebookAction],
       });
     }
   }

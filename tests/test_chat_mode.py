@@ -1,4 +1,5 @@
-﻿import pytest
+﻿import json
+import pytest
 
 from fastapi.testclient import TestClient
 
@@ -641,6 +642,40 @@ def test_attachment_delete_removes_stored_file(tmp_path, monkeypatch):
         assert not __import__("pathlib").Path(path).exists()
 
 
+def test_host_browser_ocr_extract_parses_multimodal_json(tmp_path, monkeypatch):
+    monkeypatch.setenv("LANGGRAPH_STATE_DIR", str(tmp_path))
+
+    def fake_vision(prompt, image_base64, mime_type="image/png", system_prompt=""):
+        assert image_base64 == "ZmFrZQ=="
+        assert mime_type == "image/png"
+        assert "user query" in prompt
+        return {
+            "ok": True,
+            "data": {
+                "content": '{"text":"Tuyển DevOps Intern tại HCM","confidence":"high","reason":"dom-thieu-nen-doc-anh"}'
+            },
+        }
+
+    monkeypatch.setattr(app_module, "cliproxy_vision", fake_vision)
+    with TestClient(app) as client:
+        res = client.post(
+            "/api/host-browser/ocr-extract",
+            json={
+                "image_base64": "ZmFrZQ==",
+                "mime_type": "image/png",
+                "query": "tìm bài tuyển intern devops ở hcm",
+                "title": "Facebook",
+                "url": "https://facebook.com/search/posts?q=devops",
+                "excerpt": "DOM ít chữ",
+            },
+        )
+        assert res.status_code == 200
+        body = res.json()
+        assert body["ok"] is True
+        assert body["data"]["text"] == "Tuyển DevOps Intern tại HCM"
+        assert body["data"]["confidence"] == "high"
+
+
 def test_delete_job_removes_session_attachments(tmp_path, monkeypatch):
     monkeypatch.setenv("LANGGRAPH_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(app_module, "cliproxy_chat", lambda messages, system_prompt="": {"ok": False, "data": {}})
@@ -1009,6 +1044,285 @@ def test_safe_host_browser_action_auto_runs_tool(tmp_path, monkeypatch):
         assert captured["context"]["action"] == "list"
         assert captured["context"]["permission_mode"] == "auto_review"
         assert approved["pending_actions"][0]["status"] == "done"
+
+
+def test_natural_language_facebook_research_routes_to_host_browser(tmp_path, monkeypatch):
+    monkeypatch.setenv("LANGGRAPH_STATE_DIR", str(tmp_path))
+    captured = {}
+
+    def fake_host_browser_call(path, payload=None, method="POST", timeout=30):
+        captured["path"] = path
+        captured["payload"] = payload or {}
+        return {
+            "ok": True,
+            "result": {
+                "total_found": 2,
+                "filtered_count": 1,
+                "items": [
+                    {
+                        "author": "DevOps VietNam",
+                        "url": "https://facebook.com/example",
+                        "excerpt": "Tuyen DevOps Intern tai HCM",
+                    }
+                ],
+            },
+        }
+
+    monkeypatch.setattr(app_module, "host_browser_call", fake_host_browser_call)
+
+    with TestClient(app) as client:
+        chat = client.post("/api/chats", json={"permission_mode": "auto_review"}).json()["job"]
+        updated = client.post(
+            f"/api/jobs/{chat['id']}/messages",
+            json={"content": "lên facebook tìm bài tuyển devops intern hcm và trả link cho mình"},
+        ).json()["job"]
+        assert updated["pending_actions"][0]["kind"] == "host_browser_facebook_research"
+        assert "devops intern hcm" in str(updated["pending_actions"][0]["payload"].get("query") or "").lower()
+        assert updated["pending_actions"][0]["status"] == "pending"
+
+        approved = client.post(f"/api/actions/{updated['pending_actions'][0]['id']}/approve").json()["job"]
+
+        assert captured["path"] == "/facebook-research"
+        assert "devops intern hcm" in str(captured["payload"].get("query") or "").lower()
+        assert not any(action["kind"] == "host_browser_facebook_research" and action["status"] == "pending" for action in approved["pending_actions"])
+
+
+def test_natural_language_face_alias_routes_to_host_browser(tmp_path, monkeypatch):
+    monkeypatch.setenv("LANGGRAPH_STATE_DIR", str(tmp_path))
+    captured = {}
+
+    def fake_host_browser_call(path, payload=None, method="POST", timeout=30):
+        captured["path"] = path
+        captured["payload"] = payload or {}
+        return {"ok": True, "result": {"total_found": 0, "filtered_count": 0, "items": []}}
+
+    monkeypatch.setattr(app_module, "host_browser_call", fake_host_browser_call)
+
+    with TestClient(app) as client:
+        chat = client.post("/api/chats", json={"permission_mode": "auto_review"}).json()["job"]
+        updated = client.post(
+            f"/api/jobs/{chat['id']}/messages",
+            json={"content": "tìm cho tôi trên face 5 bài tuyển dụng devops hcm"},
+        ).json()["job"]
+        assert updated["pending_actions"][0]["kind"] == "host_browser_facebook_research"
+        approved = client.post(f"/api/actions/{updated['pending_actions'][0]['id']}/approve").json()["job"]
+        assert captured["path"] == "/facebook-research"
+        assert "devops hcm" in str(captured["payload"].get("query") or "").lower()
+        assert approved["messages"][-1]["content"]
+
+
+def test_face_query_is_sanitized_before_host_browser_search():
+    decision = app_module.direct_host_browser_decision(
+        "tìm cho tôi trên face 5 bài tuyển dụng devops hcm 1 tháng đổ lại đây"
+    )
+    assert decision is not None
+    payload = decision["action"]["payload"]
+    assert payload["query"] == "tuyển dụng devops hcm 1 tháng đổ lại đây"
+    assert "tìm cho tôi" not in payload["query"].lower()
+    assert "trên face" not in payload["query"].lower()
+
+
+def test_host_browser_facebook_rerank_uses_model_to_reorder_candidates(tmp_path, monkeypatch):
+    monkeypatch.setenv("LANGGRAPH_STATE_DIR", str(tmp_path))
+
+    def fake_chat(messages, system_prompt=""):
+        assert "xếp hạng candidate bài Facebook" in system_prompt
+        assert "tìm trọ quận 7 dưới 5 triệu" in messages[-1]["content"]
+        return {
+            "ok": True,
+            "data": {
+                "content": (
+                    '{"intent":"tìm trọ quận 7 dưới 5 triệu",'
+                    '"criteria":["đúng nhu cầu thuê trọ","ưu tiên giá và khu vực rõ","ưu tiên bài mới"],'
+                    '"summary":"Ưu tiên bài cho thuê thật có giá và vị trí cụ thể.",'
+                    '"ranked_items":['
+                    '{"index":1,"score":9.8,"verdict":"strong","reason":"Bài cho thuê thật, có giá và quận cụ thể."},'
+                    '{"index":0,"score":2.1,"verdict":"weak","reason":"Đây là người đang đi tìm phòng, không phải bài cho thuê."}'
+                    ']}'
+                )
+            },
+        }
+
+    monkeypatch.setattr(app_module, "cliproxy_chat", fake_chat)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/host-browser/facebook-rerank",
+            json={
+                "query": "tìm trọ quận 7 dưới 5 triệu",
+                "top_k": 2,
+                "items": [
+                    {
+                        "url": "https://facebook.com/post-seeking-room",
+                        "author": "Minh",
+                        "text": "Mình đang tìm phòng trọ quận 7, ngân sách dưới 5 triệu.",
+                        "excerpt": "Mình đang tìm phòng trọ quận 7.",
+                        "time_hint": "1 giờ",
+                    },
+                    {
+                        "url": "https://facebook.com/post-rental",
+                        "author": "Cho thuê trọ Quận 7",
+                        "text": "Cho thuê phòng trọ quận 7, gần Lotte, giá 4.8 triệu, có nội thất cơ bản.",
+                        "excerpt": "Cho thuê phòng trọ quận 7 giá 4.8 triệu.",
+                        "time_hint": "2 giờ",
+                    },
+                ],
+            },
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["ok"] is True
+        assert body["data"]["intent"] == "tìm trọ quận 7 dưới 5 triệu"
+        assert body["data"]["ranked_items"][0]["index"] == 1
+        assert body["data"]["ranked_items"][0]["verdict"] == "strong"
+        assert body["data"]["ranked_items"][1]["index"] == 0
+
+
+def test_host_browser_facebook_search_plan_expands_query_variants(tmp_path, monkeypatch):
+    monkeypatch.setenv("LANGGRAPH_STATE_DIR", str(tmp_path))
+
+    def fake_chat(messages, system_prompt=""):
+        assert "search planner cho trợ lý Facebook research" in system_prompt
+        assert "tuyển intern devops hcm" in messages[-1]["content"]
+        return {
+            "ok": True,
+            "data": {
+                "content": (
+                    '{"intent":"tìm bài tuyển dụng devops intern tại HCM",'
+                    '"criteria":["đúng bài tuyển thật","đúng role tương đương","đúng location/seniority"],'
+                    '"query_variants":["devops intern hcm","thực tập sinh devops tphcm","cloud intern ho chi minh","sre fresher sai gon"],'
+                    '"negative_signals":["bài ứng viên đi tìm việc","bài lệch chủ đề"],'
+                    '"profile":{"original_query":"tuyển intern devops hcm","normalized_query":"tuyển intern devops hcm","roleTerms":["devops","sre","cloud"],"seniorityTerms":["intern","fresher"],"locationTerms":["hcm","tphcm","ho chi minh"],"mustIncludeGroups":[["devops","sre","cloud"],["intern","fresher"],["hcm","tphcm","ho chi minh"]]},'
+                    '"summary":"Mở rộng query theo role tương đương và alias location."}'
+                )
+            },
+        }
+
+    monkeypatch.setattr(app_module, "cliproxy_chat", fake_chat)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/host-browser/facebook-search-plan",
+            json={"query": "tuyển intern devops hcm", "max_queries": 5},
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["ok"] is True
+        assert body["data"]["intent"] == "tìm bài tuyển dụng devops intern tại HCM"
+        assert "devops intern hcm" in body["data"]["query_variants"]
+        assert "cloud intern ho chi minh" in body["data"]["query_variants"]
+        assert "sre" in " ".join(body["data"]["profile"]["roleTerms"]).lower()
+
+
+def test_host_browser_search_plan_sanitizes_natural_language_query(tmp_path, monkeypatch):
+    monkeypatch.setenv("LANGGRAPH_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        app_module,
+        "cliproxy_chat",
+        lambda messages, system_prompt="": {"ok": False, "summary": "planner unavailable"},
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/host-browser/facebook-search-plan",
+            json={"query": "tìm cho tôi trên face 5 bài tuyển dụng devops hcm 1 tháng đổ lại đây", "max_queries": 5},
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["ok"] is True
+        assert body["data"]["query_variants"][0] == "tuyển dụng devops hcm 1 tháng đổ lại đây"
+        assert "tìm cho tôi" not in body["data"]["query_variants"][0].lower()
+        assert "trên face" not in body["data"]["query_variants"][0].lower()
+
+
+def test_format_facebook_research_message_returns_clean_ranked_list():
+    payload = {
+        "ok": True,
+        "data": {
+            "summary": {
+                "recent_confirmed_count": 2,
+                "time_unknown_count": 1,
+            },
+            "results": [
+                {
+                    "author": "DevOps VietNam",
+                    "summary": "[Q7 - HCM] Cloudteam tuyển System & DevOps (Intern)",
+                    "url": "https://facebook.com/post1",
+                    "time_status": "recent_confirmed",
+                    "keep_reason": "Đúng DevOps intern tại HCM, có mô tả rõ.",
+                },
+                {
+                    "author": "Tuyển dụng DevOps",
+                    "summary": "DEVOPS INTERN - TMA Tech Group",
+                    "url": "https://facebook.com/post2",
+                    "time_status": "time_unknown",
+                    "keep_reason": "Đúng role nhưng chưa xác nhận được ngày.",
+                },
+            ],
+        },
+    }
+
+    text = app_module.format_facebook_research_message(json.dumps(payload, ensure_ascii=False))
+    assert "2 bài xác nhận còn mới" in text
+    assert "1. DevOps VietNam" in text
+    assert "Nội dung chính: [Q7 - HCM] Cloudteam tuyển System & DevOps (Intern)" in text
+    assert "Lý do giữ: Đúng DevOps intern tại HCM, có mô tả rõ." in text
+    assert "Link: https://facebook.com/post1" in text
+    assert "Thời gian: đã xác nhận còn mới" in text
+
+
+def test_format_facebook_research_message_empty_explains_why():
+    payload = {
+        "ok": True,
+        "data": {
+            "total_found": 12,
+            "filtered_count": 0,
+            "summary": {
+                "time_window_label": "1m",
+                "recent_confirmed_count": 0,
+                "time_unknown_count": 4,
+                "stale_confirmed_count": 2,
+                "planner_summary": "Đã mở rộng query và lọc theo thời gian.",
+            },
+            "items": [],
+            "results": [],
+        },
+    }
+    text = app_module.format_facebook_research_message(json.dumps(payload, ensure_ascii=False))
+    assert "Đã quét 12 candidate" in text
+    assert "Điều kiện thời gian đang bật: `1m`" in text
+
+
+def test_format_facebook_research_message_accepts_live_result_shape():
+    payload = {
+        "ok": True,
+        "result": {
+            "total_found": 40,
+            "filtered_count": 23,
+            "summary": {
+                "recent_confirmed_count": 0,
+                "time_unknown_count": 0,
+                "stale_confirmed_count": 0,
+            },
+            "results": [
+                {
+                    "author": "Devops tuyển dụng",
+                    "summary": "Tuyển DevOps Engineer tại Thủ Đức TP.HCM, onsite, up to 28M NET.",
+                    "url": "https://facebook.com/post-live",
+                    "time_status": "none",
+                    "keep_reason": "Có địa điểm HCM rất rõ và JD khá cụ thể.",
+                }
+            ],
+        },
+    }
+
+    text = app_module.format_facebook_research_message(json.dumps(payload, ensure_ascii=False))
+    assert "Trả về 1 bài phù hợp nhất" in text
+    assert "1. Devops tuyển dụng" in text
+    assert "Nội dung chính: Tuyển DevOps Engineer tại Thủ Đức TP.HCM, onsite, up to 28M NET." in text
+    assert "Lý do giữ: Có địa điểm HCM rất rõ và JD khá cụ thể." in text
+    assert "Link: https://facebook.com/post-live" in text
 
 
 def test_approve_action_can_queue_next_agent_action(tmp_path, monkeypatch):
@@ -1531,3 +1845,4 @@ def test_running_jobs_are_failed_on_startup_cleanup(tmp_path, monkeypatch):
     job = app_module.db.get_job("lg_running")
     assert job["status"] == "failed"
     assert "server restarted" in job["error"]
+

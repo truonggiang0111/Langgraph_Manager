@@ -6,6 +6,7 @@ import { ChevronDown, ChevronRight, CheckCircle, XCircle, FileText, Terminal, Ci
 import { memo, useEffect, useRef, useState } from 'react';
 import { Badge } from './ui/badge';
 import { formatDistanceToNowStrict } from 'date-fns';
+import { FacebookResearchResult } from './FacebookResearchResult';
 
 interface ActionCardProps {
   action: Action;
@@ -22,6 +23,12 @@ const actionIcons = {
   workspace_inspect: FileText,
   workspace_read_file: FileText,
   workspace_diff: FileText,
+  host_browser_list: FileText,
+  host_browser_open: FileText,
+  host_browser_open_current: FileText,
+  host_browser_launch: FileText,
+  host_browser_facebook_research: FileText,
+  host_browser_screenshot: FileText,
   create_memory: FileText,
   create_skill: FileText,
   note: FileText,
@@ -34,7 +41,8 @@ function ActionCardInner({ action, onApprove, onReject, onViewLogs, onViewResult
   const [nowTick, setNowTick] = useState(() => Date.now());
   const [planSteps, setPlanSteps] = useState<string[]>([]);
   const stepRefs = useRef<Record<number, HTMLTextAreaElement | null>>({});
-  const Icon = actionIcons[action.kind];
+  const Icon = actionIcons[action.kind] || FileText;
+  const isFacebookResultCard = action.kind === 'host_browser_facebook_research' && !!action.facebookResearch && action.status === 'done';
   const isPlanAction = action.id.startsWith('plan-');
   const canInlineEditPlan = isPlanAction && action.status === 'pending';
   const completedSteps = Math.max(0, Math.min(planSteps.length, action.planCompletedSteps || 0));
@@ -80,6 +88,10 @@ function ActionCardInner({ action, onApprove, onReject, onViewLogs, onViewResult
     medium: 'bg-orange-100 text-orange-700',
     high: 'bg-red-100 text-red-700'
   };
+
+  if (isFacebookResultCard && action.facebookResearch) {
+    return <FacebookResearchResult data={action.facebookResearch} />;
+  }
 
   return (
     <Card className="border-l-4 border-l-orange-500 bg-white">
@@ -152,6 +164,8 @@ function ActionCardInner({ action, onApprove, onReject, onViewLogs, onViewResult
                 <p className="text-xs text-orange-600">Đang chạy: {action.planRunningDetail}</p>
               )}
             </div>
+          ) : action.facebookResearch ? (
+            <FacebookResearchResult data={action.facebookResearch} />
           ) : action.result && (
             <div className="bg-gray-50 rounded-md p-3">
               <p className="text-xs font-medium text-gray-500 mb-1">Result</p>
@@ -212,6 +226,8 @@ function ActionCardInner({ action, onApprove, onReject, onViewLogs, onViewResult
 }
 
 function areEqual(prev: ActionCardProps, next: ActionCardProps) {
+  const prevFb = prev.action.facebookResearch;
+  const nextFb = next.action.facebookResearch;
   return (
     prev.action.id === next.action.id
     && prev.action.status === next.action.status
@@ -220,6 +236,8 @@ function areEqual(prev: ActionCardProps, next: ActionCardProps) {
     && prev.action.result === next.action.result
     && prev.action.timestamp.getTime() === next.action.timestamp.getTime()
     && (prev.action.logs?.length || 0) === (next.action.logs?.length || 0)
+    && (prevFb?.summaryText || '') === (nextFb?.summaryText || '')
+    && (prevFb?.items.length || 0) === (nextFb?.items.length || 0)
   );
 }
 

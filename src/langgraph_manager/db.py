@@ -400,13 +400,44 @@ def get_job(job_id: str) -> dict[str, Any] | None:
                 (job_id,),
             )
         ]
+        recent_terminal_cutoff = datetime.fromtimestamp(
+            datetime.now(timezone.utc).timestamp() - 180,
+            tz=timezone.utc,
+        ).isoformat()
         job["pending_actions"] = [
             row_to_pending_action(r)
             for r in con.execute(
-                "SELECT * FROM pending_actions WHERE job_id = ? AND status IN ('pending','running') ORDER BY id",
-                (job_id,),
+                """
+                SELECT * FROM pending_actions
+                WHERE job_id = ?
+                  AND (
+                    status IN ('pending','running')
+                    OR (status IN ('done','failed','rejected') AND updated_at >= ?)
+                  )
+                ORDER BY id
+                """,
+                (job_id, recent_terminal_cutoff),
             )
         ]
+        has_recent_facebook_done = any(
+            str(item.get("kind") or "") == "host_browser_facebook_research"
+            and str(item.get("status") or "") == "done"
+            for item in job["pending_actions"]
+        )
+        if not has_recent_facebook_done:
+            latest_facebook_done = con.execute(
+                """
+                SELECT * FROM pending_actions
+                WHERE job_id = ?
+                  AND kind = 'host_browser_facebook_research'
+                  AND status = 'done'
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (job_id,),
+            ).fetchone()
+            if latest_facebook_done:
+                job["pending_actions"].append(row_to_pending_action(latest_facebook_done))
         memory = con.execute("SELECT * FROM session_memory WHERE job_id = ?", (job_id,)).fetchone()
         job["session_memory"] = dict(memory) if memory else default_session_memory(job_id)
         return job

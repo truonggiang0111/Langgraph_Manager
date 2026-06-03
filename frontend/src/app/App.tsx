@@ -46,9 +46,11 @@ export default function App() {
   const [settingsData, setSettingsData] = useState(emptySettings);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
+  const [jobStreamConnected, setJobStreamConnected] = useState(false);
   const selectJobAbortRef = useRef<AbortController | null>(null);
   const sendInFlightRef = useRef(false);
   const lastSendRef = useRef<{ content: string; at: number }>({ content: '', at: 0 });
+  const pollBurstUntilRef = useRef(0);
 
   const sessions = useMemo(() => jobs.map(mapJobToSession), [jobs]);
   const activeSessionId = activeJob?.id || sessions[0]?.id || '';
@@ -57,6 +59,16 @@ export default function App() {
     () => mapJobToActions(activeJob).find(action => action.id === selectedActionId) || null,
     [activeJob, selectedActionId],
   );
+
+  const upsertJobLocally = useCallback((job: BackendJob) => {
+    setJobs(prev => {
+      const next = prev.slice();
+      const index = next.findIndex(item => item.id === job.id);
+      if (index >= 0) next[index] = job;
+      else next.unshift(job);
+      return next;
+    });
+  }, []);
 
   const refreshJobs = useCallback(async () => {
     const nextJobs = await listJobs();
@@ -126,7 +138,42 @@ export default function App() {
   }, [settingsOpen, refreshSettings]);
 
   useEffect(() => {
+    if (!activeJob?.id || typeof window === 'undefined' || typeof EventSource === 'undefined') {
+      setJobStreamConnected(false);
+      return;
+    }
+    const source = new EventSource(`/api/jobs/${activeJob.id}/events`);
+
+    const handleJob = (event: MessageEvent) => {
+      try {
+        const payload = JSON.parse(event.data || '{}') as { job?: BackendJob };
+        if (!payload.job) return;
+        setJobStreamConnected(true);
+        setActiveJob(payload.job);
+        upsertJobLocally(payload.job);
+      } catch {
+        // ignore malformed SSE payloads
+      }
+    };
+
+    const handleOpen = () => setJobStreamConnected(true);
+    const handleError = () => setJobStreamConnected(false);
+
+    source.addEventListener('job', handleJob as EventListener);
+    source.addEventListener('open', handleOpen as EventListener);
+    source.addEventListener('error', handleError as EventListener);
+    source.onopen = handleOpen;
+    source.onerror = handleError;
+
+    return () => {
+      setJobStreamConnected(false);
+      source.close();
+    };
+  }, [activeJob?.id, upsertJobLocally]);
+
+  useEffect(() => {
     if (!activeJob) return;
+    if (jobStreamConnected) return;
     const shouldPoll = activeJob.status === 'running' || activeJob.pending_actions?.some(action => action.status === 'running');
     if (!shouldPoll) return;
     let cancelled = false;
@@ -136,6 +183,9 @@ export default function App() {
 
     const nextDelay = () => {
       const elapsed = Date.now() - startedAt;
+      const burstUntil = pollBurstUntilRef.current;
+      if (burstUntil && Date.now() < burstUntil) return 250;
+      if (elapsed < 10_000) return 700;
       if (elapsed < 30_000) return 1800;
       if (elapsed < 90_000) return 2500;
       return 3500;
@@ -161,6 +211,28 @@ export default function App() {
         const stillRunning = job.status === 'running' || job.pending_actions?.some(action => action.status === 'running');
         if (stillRunning) {
           timer = window.setTimeout(poll, nextDelay());
+          return;
+        }
+
+        const previousMessageCount = activeJob.messages?.length || 0;
+        const latestMessageCount = job.messages?.length || 0;
+        if (latestMessageCount <= previousMessageCount) {
+          timer = window.setTimeout(async () => {
+            try {
+              const confirmed = await getJob(activeJob.id);
+              if (cancelled) return;
+              setActiveJob(confirmed);
+              setJobs(prev => {
+                const next = prev.slice();
+                const index = next.findIndex(item => item.id === confirmed.id);
+                if (index >= 0) next[index] = confirmed;
+                else next.unshift(confirmed);
+                return next;
+              });
+            } catch {
+              // ignore one-shot confirmation fetch failures
+            }
+          }, 450);
         }
       } catch {
         if (timer) window.clearTimeout(timer);
@@ -173,22 +245,12 @@ export default function App() {
       inFlight?.abort();
       if (timer) window.clearTimeout(timer);
     };
-  }, [activeJob?.id, activeJob?.status, activeJob?.pending_actions]);
+  }, [activeJob?.id, activeJob?.status, activeJob?.pending_actions, jobStreamConnected]);
 
   const updateActiveJob = async (job: BackendJob) => {
     setActiveJob(job);
     await refreshJobs();
   };
-
-  const upsertJobLocally = useCallback((job: BackendJob) => {
-    setJobs(prev => {
-      const next = prev.slice();
-      const index = next.findIndex(item => item.id === job.id);
-      if (index >= 0) next[index] = job;
-      else next.unshift(job);
-      return next;
-    });
-  }, []);
 
   const handleSendMessage = async (content: string, files: AttachedFile[], planMode: boolean) => {
     const normalized = content.trim();
@@ -205,6 +267,7 @@ export default function App() {
     const permissionMode = (activeJob?.permission_mode || 'full_access') as PermissionMode;
     setBusy(true);
     try {
+      pollBurstUntilRef.current = Date.now() + 4000;
       let job = activeJob;
       const optimisticAt = new Date().toISOString();
       if (job) {
@@ -312,6 +375,9 @@ export default function App() {
     if (!activeJob) return;
     setBusy(true);
     try {
+      if (mode === 'approve' || mode === 'run') {
+        pollBurstUntilRef.current = Date.now() + 4000;
+      }
       let job: BackendJob;
       if (mode === 'reconfirm') {
         const comment = window.prompt('What changed or what should be clarified before approve?', '') || '';
@@ -352,6 +418,7 @@ export default function App() {
   const handleActionDecision = async (id: string, decision: 'approve' | 'reject') => {
     if (id.startsWith('plan-')) {
       if (decision === 'approve') {
+        pollBurstUntilRef.current = Date.now() + 4000;
         const jobId = id.replace(/^plan-/, '');
         if (activeJob?.id === jobId) {
           const optimisticRunning: BackendJob = {
@@ -390,6 +457,9 @@ export default function App() {
     }
     setBusy(true);
     try {
+      if (decision === 'approve') {
+        pollBurstUntilRef.current = Date.now() + 4000;
+      }
       const job = decision === 'approve' ? await approveAction(id) : await rejectAction(id);
       await updateActiveJob(job);
     } catch (error) {

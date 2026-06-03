@@ -15,6 +15,7 @@ services:
       LANGGRAPH_PYTHON: python
       LANGGRAPH_UI_URL: http://host.docker.internal:8899/api/health
       LANGGRAPH_PUBLIC_URL: https://langgraph.clawflow.shop
+      HOST_BROWSER_BRIDGE_URL: http://10.5.0.2:3342
       CLIPROXY_BASE_URL: http://host.docker.internal:8317
       CLIPROXY_MODEL: gpt-5.4
       CLIPROXY_CHAT_MODEL: gpt-5.4

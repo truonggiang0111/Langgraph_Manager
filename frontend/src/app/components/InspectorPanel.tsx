@@ -3,6 +3,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from './ui/tabs';
 import { ScrollArea } from './ui/scroll-area';
 import { ChevronRight } from 'lucide-react';
 import { Button } from './ui/button';
+import { FacebookResearchResult } from './FacebookResearchResult';
 
 interface InspectorPanelProps {
   selectedAction: Action | null;
@@ -89,7 +90,12 @@ export function InspectorPanel({ selectedAction, collapsed, onToggleCollapse }: 
                 <p className="text-sm text-gray-600">{selectedAction.description}</p>
               </div>
 
-              {selectedAction.result && (
+              {selectedAction.facebookResearch ? (
+                <div>
+                  <h3 className="text-sm font-medium text-gray-700 mb-2">Facebook Research</h3>
+                  <FacebookResearchResult data={selectedAction.facebookResearch} />
+                </div>
+              ) : selectedAction.result && (
                 <div>
                   <h3 className="text-sm font-medium text-gray-700 mb-2">Result</h3>
                   <div className="bg-gray-50 rounded-md p-3 text-sm text-gray-700">

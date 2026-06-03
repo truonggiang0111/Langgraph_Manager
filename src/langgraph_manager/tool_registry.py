@@ -750,6 +750,55 @@ def cliproxy_chat(messages: list[dict[str, str]], system_prompt: str = "") -> di
         return {"ok": False, "summary": f"CLIProxy chat failed: {exc}", "data": {"base_url": base_url, "model": model}}
 
 
+def cliproxy_vision(prompt: str, image_base64: str, mime_type: str = "image/png", system_prompt: str = "") -> dict[str, Any]:
+    base_url = os.getenv("CLIPROXY_BASE_URL", "http://host.docker.internal:8317").rstrip("/")
+    model = os.getenv(
+        "CLIPROXY_VISION_MODEL",
+        os.getenv("CLIPROXY_CHAT_MODEL", os.getenv("CLIPROXY_MODEL", "gpt-5.5")),
+    )
+    try:
+        api_key = _cliproxy_api_key(base_url)
+        if not api_key:
+            return {"ok": False, "summary": "Missing CLIProxy API key", "data": {"base_url": base_url, "model": model}}
+    except Exception as exc:
+        return {"ok": False, "summary": f"CLIProxy API key lookup failed: {exc}", "data": {"base_url": base_url, "model": model}}
+
+    user_content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+    if image_base64:
+        user_content.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime_type};base64,{image_base64}"},
+            }
+        )
+    prompt_messages: list[dict[str, Any]] = []
+    if system_prompt:
+        prompt_messages.append({"role": "system", "content": system_prompt})
+    prompt_messages.append({"role": "user", "content": user_content})
+    payload = {
+        "model": model,
+        "messages": prompt_messages,
+        "temperature": float(os.getenv("CLIPROXY_CHAT_TEMPERATURE", "0.2")),
+        "max_tokens": int(os.getenv("CLIPROXY_VISION_MAX_TOKENS", os.getenv("CLIPROXY_CHAT_MAX_TOKENS", "1200"))),
+    }
+    try:
+        data = _http_json(
+            "POST",
+            f"{base_url}/v1/chat/completions",
+            payload,
+            token=api_key,
+            timeout=int(os.getenv("CLIPROXY_TIMEOUT_SECONDS", "180")),
+        )
+        content = (((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
+        return {
+            "ok": bool(content),
+            "summary": "CLIProxy vision returned content" if content else "CLIProxy vision returned empty content",
+            "data": {"model": data.get("model", model), "content": content, "usage": data.get("usage", {})},
+        }
+    except Exception as exc:
+        return {"ok": False, "summary": f"CLIProxy vision failed: {exc}", "data": {"base_url": base_url, "model": model}}
+
+
 def cliproxy_chat_stream(messages: list[dict[str, str]], system_prompt: str = ""):
     base_url = os.getenv("CLIPROXY_BASE_URL", "http://host.docker.internal:8317").rstrip("/")
     model = os.getenv("CLIPROXY_CHAT_MODEL", os.getenv("CLIPROXY_MODEL", "gpt-5.5"))

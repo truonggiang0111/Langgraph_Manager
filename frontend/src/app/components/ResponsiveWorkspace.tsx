@@ -12,6 +12,7 @@ import { FileText, Menu, Settings, Terminal } from 'lucide-react';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from './ui/tabs';
 import { ScrollArea } from './ui/scroll-area';
 import { BackendJob, PermissionMode } from '../api';
+import { FacebookResearchResult } from './FacebookResearchResult';
 
 const INSPECTOR_COLLAPSED_KEY = 'lg_inspector_collapsed';
 
@@ -234,7 +235,12 @@ export function ResponsiveWorkspace({
                         <p className="text-sm text-gray-600">{selectedAction.description}</p>
                       </div>
 
-                      {selectedAction.result && (
+                      {selectedAction.facebookResearch ? (
+                        <div>
+                          <h3 className="text-sm font-medium text-gray-700 mb-2">Facebook Research</h3>
+                          <FacebookResearchResult data={selectedAction.facebookResearch} />
+                        </div>
+                      ) : selectedAction.result && (
                         <div>
                           <h3 className="text-sm font-medium text-gray-700 mb-2">Result</h3>
                           <div className="bg-gray-50 rounded-md p-3 text-sm text-gray-700">

@@ -8,6 +8,12 @@ export type ActionKind =
   | 'workspace_diff'
   | 'create_memory'
   | 'create_skill'
+  | 'host_browser_list'
+  | 'host_browser_open'
+  | 'host_browser_open_current'
+  | 'host_browser_launch'
+  | 'host_browser_facebook_research'
+  | 'host_browser_screenshot'
   | 'note'
   | 'git_checkpoint'
   | 'git_restore_checkpoint';
@@ -27,6 +33,23 @@ export interface Action {
   planTotalSteps?: number;
   planCompletedSteps?: number;
   planRunningDetail?: string;
+  facebookResearch?: {
+    summaryText: string;
+    counts: {
+      recentConfirmed: number;
+      timeUnknown: number;
+      staleConfirmed: number;
+    };
+    items: Array<{
+      rank: number;
+      author: string;
+      summary: string;
+      keepReason: string;
+      timeStatus: string;
+      url: string;
+      rawUrl?: string;
+    }>;
+  };
 }
 
 export interface Message {

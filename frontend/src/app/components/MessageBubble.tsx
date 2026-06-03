@@ -53,7 +53,8 @@ function MessageBubbleInner({ message, onSelectAction, onActionDecision, onRecon
             href={href}
             target="_blank"
             rel="noreferrer"
-            className={`underline underline-offset-2 ${isUser ? 'text-orange-200' : 'text-orange-600'}`}
+            className={`break-all [overflow-wrap:anywhere] underline underline-offset-2 ${isUser ? 'text-orange-200' : 'text-orange-600'}`}
+            title={match}
           >
             {match}
           </a>,
@@ -89,10 +90,10 @@ function MessageBubbleInner({ message, onSelectAction, onActionDecision, onRecon
       <div className={`flex-1 max-w-[80%] ${isUser ? 'items-end' : 'items-start'} flex flex-col`}>
         {(hasContent || hasAttachments) && (
           <div className={`
-            rounded-lg px-3 py-2
+            min-w-0 max-w-full overflow-hidden rounded-lg px-3 py-2
             ${isUser ? 'bg-gray-700 text-white' : 'bg-white border border-gray-200'}
           `}>
-            {hasContent && <p className="text-sm whitespace-pre-wrap break-words">{renderContent(message.content)}</p>}
+            {hasContent && <p className="text-sm whitespace-pre-wrap break-words [overflow-wrap:anywhere]">{renderContent(message.content)}</p>}
             {hasAttachments && (
               <div className={`${hasContent ? 'mt-2' : ''} flex flex-wrap gap-2`}>
                 {message.attachments!.map((file) => (
@@ -168,6 +169,8 @@ function areEqual(prev: MessageBubbleProps, next: MessageBubbleProps) {
       || a.result !== b.result
       || a.timestamp.getTime() !== b.timestamp.getTime()
       || (a.logs?.length || 0) !== (b.logs?.length || 0)
+      || (a.facebookResearch?.summaryText || '') !== (b.facebookResearch?.summaryText || '')
+      || (a.facebookResearch?.items.length || 0) !== (b.facebookResearch?.items.length || 0)
     ) {
       return false;
     }

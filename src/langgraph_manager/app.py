@@ -34,7 +34,7 @@ from .hybrid_routing import build_routing_plan
 from .agent_runtime import run_agent_job_state as run_native_job_state
 from .executor import http_json
 from .graph import build_graph
-from .tool_registry import cliproxy_chat, cliproxy_chat_stream, describe_tools, run_tool
+from .tool_registry import cliproxy_chat, cliproxy_chat_stream, cliproxy_vision, describe_tools, run_tool
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -224,6 +224,59 @@ class RolePluginRequest(BaseModel):
     status: str = "active"
 
 
+class HostBrowserOpenRequest(BaseModel):
+    url: str = Field(min_length=1)
+    browser: str = "brave"
+
+
+class HostBrowserOpenCurrentRequest(BaseModel):
+    url: str = Field(min_length=1)
+    browser: str = "brave"
+
+
+class HostBrowserLaunchRequest(BaseModel):
+    url: str = "about:blank"
+    browser: str = "brave"
+    port: int = 9222
+    profile_dir: str = ""
+
+
+class HostBrowserFacebookResearchRequest(BaseModel):
+    query: str = Field(min_length=1)
+    browser: str = "brave"
+    port: int = 9222
+    limit: int = 8
+    scroll_rounds: int = 4
+    profile_dir: str = ""
+
+
+class HostBrowserRerankRequest(BaseModel):
+    query: str = Field(min_length=1)
+    items: list[dict[str, Any]] = Field(default_factory=list)
+    top_k: int = 5
+
+
+class HostBrowserSearchPlanRequest(BaseModel):
+    query: str = Field(min_length=1)
+    max_queries: int = 6
+
+
+class HostBrowserScreenshotRequest(BaseModel):
+    pid: int = 0
+    full_screen: bool = False
+    name: str = ""
+    artifact_dir: str = ""
+
+
+class HostBrowserOcrExtractRequest(BaseModel):
+    image_base64: str = Field(min_length=1)
+    mime_type: str = "image/png"
+    query: str = ""
+    url: str = ""
+    title: str = ""
+    excerpt: str = ""
+
+
 PERMISSION_MODES = {"default_permissions", "auto_review", "full_access"}
 MAX_FOCUS_FILE_CHARS = 80_000
 MAX_ATTACHMENT_BYTES = int(os.getenv("LANGGRAPH_MAX_ATTACHMENT_BYTES", str(8 * 1024 * 1024)))
@@ -241,7 +294,24 @@ AUX_CONTEXT_TOKEN_BUDGET = int(os.getenv("AUX_CONTEXT_TOKEN_BUDGET", "240"))
 MAX_ACTION_RECOVERY_DEPTH = 3
 MODEL_HISTORY_MESSAGES = int(os.getenv("MODEL_HISTORY_MESSAGES", "8"))
 ACTION_RESULT_ARTIFACT_THRESHOLD = int(os.getenv("ACTION_RESULT_ARTIFACT_THRESHOLD", "3000"))
-SUPPORTED_ACTION_KINDS = {"workspace_inspect", "workspace_read_file", "workspace_diff", "workspace_command", "coding_agent_executor", "create_memory", "create_skill", "note", "git_checkpoint", "git_restore_checkpoint"}
+SUPPORTED_ACTION_KINDS = {
+    "workspace_inspect",
+    "workspace_read_file",
+    "workspace_diff",
+    "workspace_command",
+    "coding_agent_executor",
+    "create_memory",
+    "create_skill",
+    "note",
+    "git_checkpoint",
+    "git_restore_checkpoint",
+    "host_browser_list",
+    "host_browser_open",
+    "host_browser_open_current",
+    "host_browser_launch",
+    "host_browser_facebook_research",
+    "host_browser_screenshot",
+}
 ASSISTANT_MESSAGE_ROLES = {"manager", "langgraph", "claude"}
 HYBRID_ROUTING_ENABLED = os.getenv("HYBRID_ROUTING_ENABLED", "1").lower() in {"1", "true", "yes"}
 # guided => use self-built routing plan (default + route-memory boost) and send recommendations to executor
@@ -294,6 +364,85 @@ def is_casual_chat(text: str) -> bool:
         r"(nghe tôi|nghe mình|nói k|nói không|có nghe không|có đó không)",
     ]
     return len(normalized) <= 160 and any(re.search(pattern, normalized) for pattern in casual_patterns)
+
+
+def sanitize_facebook_search_query(content: str) -> str:
+    request = str(content or "").strip()
+    if not request:
+        return ""
+    query = request
+    cleanup_patterns = [
+        r"^\s*(giúp\s+mình|giup minh|giúp tôi|giup toi|cho mình|cho tôi|tim giup toi|tìm giúp tôi|tim giup minh|tìm giúp mình)\s+",
+        r"^\s*(tìm\s+cho\s+tôi|tim cho toi|tìm\s+cho\s+mình|tim cho minh)\s+",
+        r"^\s*(lên|len|vào|vao|mở|mo)\s+(facebook|face)\s+",
+        r"^\s*(tìm|tim|search|research|kiếm|kiem)\s+",
+        r"^\s*\d+\s*(bài viết|bai viet|bài|post|posts)\s+",
+        r"\s*(trên|tren|ở|o)\s+(facebook|face)\s*",
+        r"\s*(bài viết|bai viet|bài|post|posts)\s*",
+        r"\s*\b(cho tôi|cho toi|cho mình|cho minh)\b\s*",
+    ]
+    for pattern in cleanup_patterns:
+        query = re.sub(pattern, " ", query, flags=re.I)
+    query = re.sub(r"^\s*\d+\s+", " ", query, flags=re.I)
+    query = re.sub(r"\s+", " ", query).strip(" .,:;-")
+    return query or request
+
+
+def direct_host_browser_decision(content: str) -> dict | None:
+    request = str(content or "").strip()
+    normalized = re.sub(r"\s+", " ", request.lower()).strip()
+    if not normalized:
+        return None
+
+    mentions_facebook = any(marker in normalized for marker in ["facebook", "fb", "face"])
+    research_markers = [
+        "tìm", "tim", "search", "research", "kiếm", "kiem",
+        "bài viết", "bai viet", "bài", "post", "posts",
+        "tuyển", "tuyen", "hiring", "viec lam", "việc làm",
+    ]
+    open_markers = [
+        "mở facebook", "mo facebook", "vào facebook", "vao facebook", "lên facebook", "len facebook",
+        "mở face", "mo face", "vào face", "vao face", "lên face", "len face", "trên face", "tren face",
+    ]
+
+    if mentions_facebook and any(marker in normalized for marker in open_markers) and not any(marker in normalized for marker in research_markers):
+        return {
+            "mode": "pending_action",
+            "reply": "Em mở Facebook bằng browser host hiện tại để dùng session local của mình.",
+            "action": {
+                "kind": "host_browser_open_current",
+                "title": "Mở Facebook trên browser host",
+                "preview": request[:4000] or "Mở Facebook bằng browser host.",
+                "payload": {
+                    "url": "https://www.facebook.com/",
+                    "browser": "brave",
+                },
+            },
+        }
+
+    if not mentions_facebook:
+        return None
+    if not any(marker in normalized for marker in research_markers):
+        return None
+
+    query = sanitize_facebook_search_query(request)
+
+    return {
+        "mode": "pending_action",
+        "reply": "Em dùng browser host với session Facebook local để tìm các bài liên quan, rồi trả nội dung chính và link.",
+        "action": {
+            "kind": "host_browser_facebook_research",
+            "title": "Research bài Facebook bằng browser host",
+            "preview": request[:4000] or "Research Facebook bằng browser host.",
+            "payload": {
+                "query": query,
+                "browser": "brave",
+                "port": 9222,
+                "limit": 8,
+                "scroll_rounds": 4,
+            },
+        },
+    }
 
 
 def casual_reply(text: str) -> str:
@@ -378,6 +527,7 @@ ASSISTANT_AGENT_SYSTEM_PROMPT = (
     "Chỉ hỏi/đòi xác nhận khi hành động có rủi ro rõ: đăng nhập Gmail/tài khoản, nhập mật khẩu/OTP/token/API key, gửi email/form chứa dữ liệu cá nhân, thanh toán, mua hàng, upload dữ liệu nhạy cảm, xóa/sửa dữ liệu, đổi cài đặt bảo mật, hoặc cấp quyền hệ thống. "
     "Không được tự nhận đã thực thi khi backend chưa trả kết quả action. "
     "Vai trò chính của bạn là router nhẹ: trả lời câu thường, còn việc nặng phải giao Claude executor. "
+    "Nếu người dùng muốn mở browser thật trên máy, research web/Facebook bằng session local, hoặc chụp màn hình host, ưu tiên action host_browser_open_current|host_browser_open|host_browser_launch|host_browser_list|host_browser_facebook_research|host_browser_screenshot thay vì giả lập bằng text. "
     "Nếu yêu cầu có dấu hiệu cần sửa/debug/review/refactor code, sửa UI/frontend, đọc/phân tích repo/source/file/PDF, tìm hàm/class/route/component, tra docs/version thư viện, hoặc cần plugin/MCP như Serena/Context7, luôn trả về pending_action kind coding_agent_executor. "
     "Không dùng answer cho các việc workspace/code nặng; chỉ dùng answer cho câu hỏi khái niệm hoặc trao đổi không cần đọc/sửa file. "
     "Nếu chỉ cần trả lời/thảo luận, dùng "
@@ -387,10 +537,11 @@ ASSISTANT_AGENT_SYSTEM_PROMPT = (
     "Nếu cần đọc workspace/repo, dùng workspace_inspect trước, workspace_read_file để đọc file cụ thể, workspace_diff để xem thay đổi; không tự sửa file bằng patch. "
     "Nếu cần code/sửa repo/UI/debug/review/refactor/docs/version/file analysis, tạo action coding_agent_executor để giao việc cho Claude executor; chỉ dùng workspace_command cho lệnh đọc/kiểm tra nhẹ không cần suy luận. "
     "Nếu cần chạy lệnh trên workspace hoặc lưu memory/skill, dùng "
-    '{"mode":"pending_action","reply":"...","action":{"kind":"workspace_inspect|workspace_read_file|workspace_diff|workspace_command|coding_agent_executor|create_memory|create_skill|note","title":"...","preview":"...","payload":{...}}}. '
+    '{"mode":"pending_action","reply":"...","action":{"kind":"workspace_inspect|workspace_read_file|workspace_diff|workspace_command|coding_agent_executor|create_memory|create_skill|host_browser_open_current|host_browser_open|host_browser_launch|host_browser_list|host_browser_facebook_research|host_browser_screenshot|note","title":"...","preview":"...","payload":{...}}}. '
     "workspace_inspect payload có thể có max_files. workspace_read_file payload cần path và có thể có max_chars. workspace_diff payload có thể có path. "
     "workspace_command payload nên có command, cwd, risk low|medium|high, timeout. "
     "coding_agent_executor payload có thể có cwd, timeout, request override; Claude executor sẽ nhận prompt qua stdin. "
+    "host_browser_open_current payload nên có url và có thể có browser; nếu browser đang mở thì focus cửa sổ hiện có và mở tab mới, nếu chưa có thì tự mở browser. host_browser_open payload nên có url và có thể có browser. host_browser_launch payload có thể có url, browser, port, profile_dir để mở browser visible với remote debugging riêng. host_browser_list không cần payload. host_browser_facebook_research payload nên có query và có thể có browser, port, limit, scroll_rounds, profile_dir; nó dùng browser debug visible với profile persistent để đọc search results/bài viết. host_browser_screenshot payload có thể có pid, full_screen, name. "
     "create_memory payload nên có kind, title, content, tags. create_skill payload nên có name, description, triggers, source, body. "
     "create_recurring_task payload nên có name, prompt, schedule, action_kind, payload, next_run_at. "
     "Sau khi một action chạy xong, hãy đọc kết quả: nếu hoàn tất thì answer; nếu cần bước tiếp thì tạo pending_action mới; nếu cần nhớ bài học thì tạo create_memory/create_skill. "
@@ -719,6 +870,20 @@ def handle_agent_message(job_id: str, content: str) -> dict:
     if job.get("title") in {"New chat", "New session"}:
         db.update_job_title(job_id, content.strip().splitlines()[0][:80] or "New session")
         job = db.get_job(job_id) or job
+    browser_decision = direct_host_browser_decision(content)
+    if browser_decision:
+        db.update_step(job_id, "analyze", "running", "Detected host browser research intent")
+        save_pending_action_from_decision(job_id, browser_decision, auto_execute_safe=True)
+        db.update_step(job_id, "analyze", "done", "Routed to host browser action")
+        trace_event(
+            "route_decision",
+            job_id=job_id,
+            route="host_browser_direct",
+            one_hop_executor=False,
+            action_kind=((browser_decision.get("action") or {}).get("kind") if isinstance(browser_decision.get("action"), dict) else ""),
+        )
+        refresh_session_memory(job_id)
+        return db.get_job(job_id) or job
     complexity = classify_chat_task_complexity(content)
     db.update_step(job_id, "analyze", "running", "Analyzing request and selecting execution route")
     casual = is_casual_chat(content)
@@ -896,7 +1061,7 @@ def execute_action_and_follow_up(action_id: int) -> None:
                 failure_count=row.get("failure_count"),
             )
         status = "done" if ok else "failed"
-        stored_output = maybe_store_action_artifact(action_id, output, is_error=not ok)
+        stored_output = maybe_store_action_artifact(action_id, output, is_error=not ok, kind=str(action.get("kind") or ""))
         if ok:
             db.update_step(action["job_id"], "verify", "running", "Verifying action result")
             record_skill_feedback_from_action(action, ok=True, output=output)
@@ -1027,9 +1192,21 @@ def compact_action_output_for_model(output: str, limit: int = 2600) -> str:
         if "ok" in parsed:
             parts.append(f"ok: {parsed.get('ok')}")
     if isinstance(data, dict):
-        for key in ("title", "url", "policy"):
+        for key in ("title", "url", "policy", "remote_debugging_url", "path", "profile_dir"):
             if data.get(key):
                 parts.append(f"{key}: {data.get(key)}")
+        if data.get("queries_used"):
+            parts.append("queries_used: " + ", ".join(str(item) for item in (data.get("queries_used") or [])[:6]))
+        if data.get("summary"):
+            try:
+                parts.append("summary:\n" + compact_text(json.dumps(data.get("summary"), ensure_ascii=False), 900))
+            except Exception:
+                parts.append("summary:\n" + compact_text(str(data.get("summary")), 900))
+        if data.get("items"):
+            try:
+                parts.append("items:\n" + compact_text(json.dumps(data.get("items"), ensure_ascii=False), 1400))
+            except Exception:
+                parts.append("items:\n" + compact_text(str(data.get("items")), 1400))
         if data.get("results"):
             parts.append("results:\n" + compact_text(json.dumps(data.get("results"), ensure_ascii=False), 1200))
         if data.get("text"):
@@ -1045,6 +1222,83 @@ def compact_action_output_for_model(output: str, limit: int = 2600) -> str:
         if screenshots:
             parts.append("screenshots: " + compact_text(json.dumps(screenshots, ensure_ascii=False), 500))
     return compact_text("\n\n".join(parts) or text, limit)
+
+
+def format_facebook_research_message(output: str) -> str:
+    try:
+        parsed = json.loads(str(output or ""))
+    except Exception:
+        return compact_text(str(output or ""), 1600)
+    data: dict[str, Any] = {}
+    if isinstance(parsed, dict):
+        if isinstance(parsed.get("result"), dict):
+            data = parsed.get("result") or {}
+        elif isinstance(parsed.get("data"), dict):
+            data = parsed.get("data") or {}
+    items = data.get("items") if isinstance(data.get("items"), list) else []
+    results = data.get("results") if isinstance(data.get("results"), list) else []
+    summary = data.get("summary") if isinstance(data.get("summary"), dict) else {}
+    if not items and not results:
+        time_label = str(summary.get("time_window_label") or "").strip()
+        total_found = int(data.get("total_found") or 0)
+        filtered_count = int(data.get("filtered_count") or 0)
+        recent_confirmed = int(summary.get("recent_confirmed_count") or 0)
+        time_unknown = int(summary.get("time_unknown_count") or 0)
+        stale_confirmed = int(summary.get("stale_confirmed_count") or 0)
+        detail = "Không tìm thấy bài nào phù hợp."
+        if total_found or filtered_count:
+            detail += f" Đã quét {total_found} candidate, còn {filtered_count} candidate sau lọc."
+        if recent_confirmed or time_unknown or stale_confirmed:
+            bucket_parts: list[str] = []
+            if recent_confirmed:
+                bucket_parts.append(f"{recent_confirmed} bài xác nhận còn mới")
+            if stale_confirmed:
+                bucket_parts.append(f"{stale_confirmed} bài xác nhận quá cũ")
+            if bucket_parts:
+                detail += " Trạng thái thời gian: " + ", ".join(bucket_parts) + "."
+        if time_label:
+            detail += f" Điều kiện thời gian đang bật: `{time_label}`."
+        planner = str(summary.get("planner_summary") or "").strip()
+        if planner:
+            detail += f" {compact_text(planner, 220)}"
+        return detail
+
+    lines: list[str] = []
+    recent_confirmed = int(summary.get("recent_confirmed_count") or 0)
+    time_unknown = int(summary.get("time_unknown_count") or 0)
+    if recent_confirmed:
+        parts: list[str] = []
+        if recent_confirmed:
+            parts.append(f"{recent_confirmed} bài xác nhận còn mới")
+        lines.append("Đã lọc xong: " + ", ".join(parts) + ".")
+    source_items = results if results else items
+    lines.append(f"Trả về {min(len(source_items), 10)} bài phù hợp nhất:")
+
+    for index, item in enumerate(source_items[:10], start=1):
+        title = clean_facebook_result_text(str(item.get("author") or f"Bài {index}"), 100) or f"Bài {index}"
+        main_text = clean_facebook_result_text(str(item.get("summary") or item.get("excerpt") or item.get("text") or ""), 220)
+        url = str(item.get("url") or "").strip()
+        bucket = str(item.get("time_status") or item.get("time_bucket") or "").strip()
+        if bucket == "recent_confirmed":
+            time_note = "đã xác nhận còn mới"
+        elif bucket == "time_unknown":
+            time_note = ""
+        elif bucket == "stale_confirmed":
+            time_note = "đã xác nhận quá cũ"
+        else:
+            time_note = clean_facebook_result_text(str(item.get("time_hint") or ""), 60)
+        reason = clean_facebook_result_text(str(item.get("keep_reason") or item.get("llm_reason") or ""), 180)
+        line = f"{index}. {title}"
+        if main_text:
+            line += f"\n   - Nội dung chính: {main_text}"
+        if reason:
+            line += f"\n   - Lý do giữ: {reason}"
+        if time_note:
+            line += f"\n   - Thời gian: {time_note}"
+        if url:
+            line += f"\n   - Link: {url}"
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def action_failure_report(action: dict, output: str) -> str:
@@ -1072,6 +1326,8 @@ def lesson_strategy_for_action(action: dict) -> str:
         return "Đổi command/cwd hoặc dùng workspace_inspect trước; không lặp command y nguyên."
     if kind == "coding_agent_executor":
         return "Rút gọn yêu cầu, thêm context file/skill phù hợp hoặc đổi hướng thực thi."
+    if kind.startswith("host_browser_"):
+        return "Kiểm tra bridge host còn sống, đổi browser/url, hoặc chụp screenshot để xác nhận trạng thái browser hiện tại."
     return "Đổi chiến lược thực thi và tránh lặp lại payload y nguyên."
 
 
@@ -1341,8 +1597,10 @@ def build_route_memory_hint(job: dict, request: str) -> str:
     return "\n".join(lines)[:1200]
 
 
-def maybe_store_action_artifact(action_id: int, output: str, is_error: bool = False) -> str:
+def maybe_store_action_artifact(action_id: int, output: str, is_error: bool = False, kind: str = "") -> str:
     text = str(output or "")
+    if str(kind or "") == "host_browser_facebook_research":
+        return text
     if len(text) <= ACTION_RESULT_ARTIFACT_THRESHOLD:
         return text
     artifact_dir = Path(os.getenv("LANGGRAPH_STATE_DIR", str(STATE_DIR))).resolve() / "action_artifacts"
@@ -1364,6 +1622,40 @@ def maybe_store_action_artifact(action_id: int, output: str, is_error: bool = Fa
         ensure_ascii=False,
         indent=2,
     )
+
+
+def hydrate_action_result_for_ui(action: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(action, dict):
+        return action
+    if str(action.get("kind") or "") != "host_browser_facebook_research":
+        return action
+    raw_result = str(action.get("result") or "").strip()
+    if not raw_result:
+        return action
+    try:
+        parsed = json.loads(raw_result)
+    except Exception:
+        return action
+    if not (isinstance(parsed, dict) and parsed.get("artifact") and parsed.get("artifact_path")):
+        return action
+    artifact_path = Path(str(parsed.get("artifact_path") or "")).expanduser()
+    if not artifact_path.exists():
+        return action
+    try:
+        hydrated = dict(action)
+        hydrated["result"] = artifact_path.read_text(encoding="utf-8")
+        return hydrated
+    except Exception:
+        return action
+
+
+def hydrate_job_for_ui(job: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(job, dict):
+        return job
+    hydrated = dict(job)
+    pending_actions = job.get("pending_actions") if isinstance(job.get("pending_actions"), list) else []
+    hydrated["pending_actions"] = [hydrate_action_result_for_ui(action) for action in pending_actions]
+    return hydrated
 
 
 def _queue_coding_recovery_action(job_id: str, failed_action: dict) -> bool:
@@ -1420,6 +1712,9 @@ def _queue_coding_recovery_action(job_id: str, failed_action: dict) -> bool:
 def agent_follow_up_after_action(job_id: str, action: dict, ok: bool, output: str) -> None:
     job = db.get_job(job_id)
     if not job:
+        return
+    if ok and action.get("kind") == "host_browser_facebook_research":
+        refresh_session_memory(job_id)
         return
     if ok and action.get("kind") == "coding_agent_executor":
         final = sanitize_manager_content(
@@ -1488,7 +1783,8 @@ def execute_pending_action(action: dict, job: dict) -> tuple[bool, str]:
     signature = action_signature(action)
     lesson = db.get_action_lesson(signature)
     kind = action.get("kind")
-    if kind != "coding_agent_executor" and lesson and lesson.get("status") == "active" and int(lesson.get("fail_count") or 0) >= 2:
+    allow_retry_kinds = {"host_browser_facebook_research"}
+    if kind not in {"coding_agent_executor", *allow_retry_kinds} and lesson and lesson.get("status") == "active" and int(lesson.get("fail_count") or 0) >= 2:
         strategy = str(lesson.get("strategy") or "")
         return False, (
             f"Action bị chặn để tránh lặp lỗi cũ (signature={signature[:8]}). "
@@ -1551,6 +1847,79 @@ def execute_pending_action(action: dict, job: dict) -> tuple[bool, str]:
                 "permission_mode": job.get("permission_mode", "auto_review"),
             },
         )
+        text = json.dumps(result, ensure_ascii=False, indent=2)
+        return bool(result.get("ok")), text
+    if kind == "host_browser_list":
+        try:
+            result = host_browser_call("/browsers", method="GET")
+        except Exception as exc:
+            return False, f"Không gọi được host browser bridge: {exc}"
+        text = json.dumps(result, ensure_ascii=False, indent=2)
+        return bool(result.get("ok")), text
+    if kind == "host_browser_open":
+        url = str(payload.get("url") or "").strip()
+        if not url:
+            return False, "host_browser_open cần payload.url"
+        req = {"url": url, "browser": str(payload.get("browser") or "brave")}
+        try:
+            result = host_browser_call("/open-url", req)
+        except Exception as exc:
+            return False, f"Không mở được browser host: {exc}"
+        text = json.dumps(result, ensure_ascii=False, indent=2)
+        return bool(result.get("ok")), text
+    if kind == "host_browser_open_current":
+        url = str(payload.get("url") or "").strip()
+        if not url:
+            return False, "host_browser_open_current cần payload.url"
+        req = {"url": url, "browser": str(payload.get("browser") or "brave")}
+        try:
+            result = host_browser_call("/open-current", req)
+        except Exception as exc:
+            return False, f"Không mở/focus được browser host hiện tại: {exc}"
+        text = json.dumps(result, ensure_ascii=False, indent=2)
+        return bool(result.get("ok")), text
+    if kind == "host_browser_launch":
+        req = {
+            "url": str(payload.get("url") or "about:blank"),
+            "browser": str(payload.get("browser") or "brave"),
+            "port": int(payload.get("port") or 9222),
+            "profile_dir": str(payload.get("profile_dir") or ""),
+        }
+        try:
+            result = host_browser_call("/launch-debug", req)
+        except Exception as exc:
+            return False, f"Không launch được debug browser host: {exc}"
+        text = json.dumps(result, ensure_ascii=False, indent=2)
+        return bool(result.get("ok")), text
+    if kind == "host_browser_facebook_research":
+        query = str(payload.get("query") or "").strip()
+        if not query:
+            return False, "host_browser_facebook_research cần payload.query"
+        req = {
+            "query": query,
+            "browser": str(payload.get("browser") or "brave"),
+            "port": int(payload.get("port") or 9222),
+            "limit": int(payload.get("limit") or 8),
+            "scroll_rounds": int(payload.get("scroll_rounds") or 4),
+            "profile_dir": str(payload.get("profile_dir") or ""),
+        }
+        try:
+            result = host_browser_call("/facebook-research", req, timeout=240)
+        except Exception as exc:
+            return False, f"Không research được Facebook host: {exc}"
+        text = json.dumps(result, ensure_ascii=False, indent=2)
+        return bool(result.get("ok")), text
+    if kind == "host_browser_screenshot":
+        req = {
+            "pid": int(payload.get("pid") or 0),
+            "full_screen": bool(payload.get("full_screen") or False),
+            "name": str(payload.get("name") or ""),
+            "artifact_dir": str(payload.get("artifact_dir") or ""),
+        }
+        try:
+            result = host_browser_call("/screenshot", req)
+        except Exception as exc:
+            return False, f"Không chụp được màn hình host: {exc}"
         text = json.dumps(result, ensure_ascii=False, indent=2)
         return bool(result.get("ok")), text
     if kind == "coding_agent_executor":
@@ -1805,6 +2174,374 @@ def compact_text(value: str, limit: int) -> str:
         text,
     )
     return text[:limit]
+
+
+def clean_facebook_result_text(value: str, limit: int) -> str:
+    text = str(value or "").strip()
+    text = re.sub(r"\bFacebook(?:\s+Facebook)+\b", "Facebook", text, flags=re.I)
+    text = re.sub(r"\b(?:Like|Comment|Share|Join|Follow|Thích|Bình luận|Chia sẻ)\b", " ", text, flags=re.I)
+    text = re.sub(r"\bSee more\b", " ", text, flags=re.I)
+    text = re.sub(r"\b\S+\.comGiang\*?", " ", text, flags=re.I)
+    text = re.sub(r"\s+", " ", text).strip(" .:-")
+    return compact_text(text, limit)
+
+
+def parse_json_payload(text: str) -> dict[str, Any]:
+    raw = str(text or "").strip()
+    if not raw:
+        return {}
+    candidates = [raw]
+    fenced = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", raw, flags=re.S)
+    candidates.extend(fenced)
+    brace_match = re.search(r"(\{.*\})", raw, flags=re.S)
+    if brace_match:
+        candidates.append(brace_match.group(1))
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except Exception:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return {}
+
+
+def fallback_host_browser_search_plan(query: str, max_queries: int = 6) -> dict[str, Any]:
+    raw_query = compact_text(sanitize_facebook_search_query(query), 300)
+    normalized = str(raw_query).lower()
+    variants: list[str] = [raw_query]
+    criteria: list[str] = []
+    intent = "facebook research"
+    profile = {
+        "original_query": raw_query,
+        "normalized_query": normalized,
+        "roleTerms": [],
+        "seniorityTerms": [],
+        "locationTerms": [],
+        "mustIncludeGroups": [],
+    }
+
+    def add_variant(*values: str) -> None:
+        for value in values:
+            clean = compact_text(value, 120).strip()
+            if clean and clean.lower() not in {item.lower() for item in variants}:
+                variants.append(clean)
+
+    has_job = any(token in normalized for token in ["tuyển", "tuyen", "việc", "viec", "job", "hiring", "recruit"])
+    has_rental = any(token in normalized for token in ["trọ", "tro", "phòng", "phong", "thuê", "thue", "ở ghép", "o ghep"])
+    has_sale = any(token in normalized for token in ["mua", "bán", "ban", "thanh lý", "thanh ly", "pass"])
+    has_review = any(token in normalized for token in ["review", "đánh giá", "danh gia", "trải nghiệm", "trai nghiem"])
+
+    role_aliases: list[str] = []
+    if any(token in normalized for token in ["devops", "sre", "cloud", "platform", "infra", "infrastructure", "sysadmin"]):
+        role_aliases = ["devops", "sre", "cloud", "platform engineer", "infrastructure", "sysadmin"]
+        profile["roleTerms"] = ["devops", "sre", "cloud", "platform", "sysadmin", "infra"]
+        profile["mustIncludeGroups"].append(["devops", "sre", "cloud", "platform", "infra"])
+    seniority_aliases: list[str] = []
+    if any(token in normalized for token in ["intern", "fresher", "thực tập", "thuc tap", "new grad", "junior", "0-1 năm", "0-1 nam"]):
+        seniority_aliases = ["intern", "thực tập sinh", "fresher", "junior", "new grad", "0-1 năm"]
+        profile["seniorityTerms"] = ["intern", "thực tập", "thực tập sinh", "fresher", "junior", "new grad"]
+        profile["mustIncludeGroups"].append(["intern", "thực tập", "fresher", "junior", "new grad"])
+    location_aliases: list[str] = []
+    if any(token in normalized for token in ["hcm", "tphcm", "tp hcm", "ho chi minh", "hcmc", "sài gòn", "sai gon"]):
+        location_aliases = ["hcm", "tphcm", "ho chi minh", "hcmc", "sài gòn", "sai gon"]
+        profile["locationTerms"] = ["hcm", "tphcm", "hồ chí minh", "sài gòn", "hcmc"]
+        profile["mustIncludeGroups"].append(["hcm", "tphcm", "ho chi minh", "sai gon", "hcmc"])
+
+    if has_job:
+        intent = "tìm bài tuyển dụng"
+        criteria = ["đúng bài tuyển thật", "đúng role tương đương", "đúng seniority/location", "ưu tiên bài mới"]
+        if role_aliases and seniority_aliases and location_aliases:
+            add_variant(
+                "devops intern hcm",
+                "tuyển devops intern tphcm",
+                "thực tập sinh devops ho chi minh",
+                "cloud intern hcm",
+                "platform engineer intern hcm",
+                "sre fresher sai gon",
+            )
+        elif role_aliases and seniority_aliases:
+            add_variant("devops intern", "thực tập sinh devops", "cloud intern", "platform fresher")
+        elif role_aliases:
+            add_variant("tuyển devops", "hiring sre", "cloud engineer hcm")
+    elif has_rental:
+        intent = "tìm bài cho thuê/trọ"
+        criteria = ["đúng bài cho thuê", "giá/khu vực rõ", "ưu tiên bài mới"]
+        add_variant(
+            raw_query.replace("tìm", "cho thuê").replace("tim", "cho thue"),
+            raw_query.replace("thuê trọ", "phòng trọ").replace("thue tro", "phong tro"),
+            raw_query.replace("quận 7", "q7").replace("quan 7", "q7"),
+        )
+    elif has_sale:
+        intent = "tìm bài mua bán"
+        criteria = ["đúng món cần tìm", "giá/tình trạng rõ", "ưu tiên bài mới"]
+    elif has_review:
+        intent = "tìm bài review/trải nghiệm"
+        criteria = ["đúng chủ đề review", "nhiều chi tiết", "ưu tiên bài có trải nghiệm thật"]
+
+    return {
+        "ok": True,
+        "intent": intent,
+        "criteria": criteria,
+        "query_variants": variants[: max(1, min(int(max_queries or 6), 10))],
+        "profile": profile,
+        "negative_signals": ["bài chỉ xin thông tin", "bài lệch chủ đề", "group/page không có nội dung bài cụ thể"],
+        "summary": "Fallback planner generated query variants.",
+        "raw": "",
+    }
+
+
+def host_browser_search_plan(query: str, max_queries: int = 6) -> dict[str, Any]:
+    cleaned_query = sanitize_facebook_search_query(query)
+    fallback = fallback_host_browser_search_plan(cleaned_query, max_queries)
+    planner_system_prompt = (
+        "Bạn là search planner cho trợ lý Facebook research. "
+        "Nhiệm vụ: hiểu ý định thật sự của user, tự sinh nhiều biến thể query để tăng recall, "
+        "bao gồm synonym, alias, cách viết khác, role tương đương, location alias và seniority tương đương nếu hợp lý. "
+        "Không chỉ lặp lại query gốc. Trả JSON thuần."
+    )
+    planner_user_prompt = (
+        "Lập kế hoạch search cho Facebook.\n"
+        f"User query: {compact_text(cleaned_query, 400)}\n"
+        f"Max queries: {max(1, min(int(max_queries or 6), 10))}\n\n"
+        'Trả JSON đúng schema: {"intent":"...","criteria":["..."],"query_variants":["..."],"negative_signals":["..."],"profile":{"original_query":"...","normalized_query":"...","roleTerms":["..."],"seniorityTerms":["..."],"locationTerms":["..."],"mustIncludeGroups":[["..."]]},"summary":"..."}'
+    )
+    started = time.perf_counter()
+    result = cliproxy_chat(
+        [{"role": "user", "content": planner_user_prompt}],
+        compose_system_prompt(planner_system_prompt),
+    )
+    trace_event(
+        "model_call",
+        route="host_browser_search_plan",
+        ok=bool(result.get("ok")),
+        elapsed_ms=round((time.perf_counter() - started) * 1000, 2),
+    )
+    if not result.get("ok"):
+        fallback["summary"] = compact_text(str(result.get("summary") or fallback.get("summary") or ""), 400)
+        return fallback
+    raw = str((result.get("data") or {}).get("content") or "").strip()
+    parsed = parse_json_payload(raw)
+    variants = parsed.get("query_variants") if isinstance(parsed.get("query_variants"), list) else []
+    cleaned_variants: list[str] = []
+    seen: set[str] = set()
+    for value in [cleaned_query, *variants]:
+        clean = compact_text(str(value or "").strip(), 120)
+        key = clean.lower()
+        if clean and key not in seen:
+            seen.add(key)
+            cleaned_variants.append(clean)
+    if not cleaned_variants:
+        fallback["raw"] = raw[:1800]
+        return fallback
+    profile = parsed.get("profile") if isinstance(parsed.get("profile"), dict) else fallback["profile"]
+    for key in ("roleTerms", "seniorityTerms", "locationTerms"):
+        values = profile.get(key) if isinstance(profile.get(key), list) else []
+        profile[key] = [compact_text(str(item), 60) for item in values[:8]]
+    groups = profile.get("mustIncludeGroups") if isinstance(profile.get("mustIncludeGroups"), list) else []
+    profile["mustIncludeGroups"] = [
+        [compact_text(str(item), 60) for item in group[:6]]
+        for group in groups if isinstance(group, list)
+    ][:6]
+    return {
+        "ok": True,
+        "intent": compact_text(str(parsed.get("intent") or fallback.get("intent") or query), 240),
+        "criteria": [compact_text(str(item), 120) for item in (parsed.get("criteria") or [])[:6]],
+        "query_variants": cleaned_variants[: max(1, min(int(max_queries or 6), 10))],
+        "negative_signals": [compact_text(str(item), 120) for item in (parsed.get("negative_signals") or [])[:6]],
+        "profile": profile,
+        "summary": compact_text(str(parsed.get("summary") or ""), 400),
+        "raw": raw[:1800],
+    }
+
+
+def fallback_host_browser_rerank(query: str, items: list[dict[str, Any]], top_k: int = 5) -> dict[str, Any]:
+    normalized_query = str(query or "").lower()
+    base_terms = _keyword_set(normalized_query)
+    rental_intent = any(term in normalized_query for term in ["trọ", "tro", "phòng", "phong", "cho thuê", "thue", "ở ghép", "o ghep", "căn hộ", "can ho"])
+    job_intent = any(term in normalized_query for term in ["tuyển", "tuyen", "việc", "viec", "job", "intern", "fresher", "devops"])
+    sale_intent = any(term in normalized_query for term in ["mua", "bán", "ban", "thanh lý", "thanh ly", "pass lại", "pass lai"])
+    review_intent = any(term in normalized_query for term in ["review", "đánh giá", "danh gia", "trải nghiệm", "trai nghiem"])
+    criteria: list[str] = ["đúng ý định chính", "nhiều chi tiết hơn", "ưu tiên bài mới nếu có thời gian"]
+    if rental_intent:
+        criteria = ["đúng bài cho thuê", "giá/khu vực rõ", "ưu tiên bài mới"]
+    elif job_intent:
+        criteria = ["đúng bài tuyển", "đúng role/seniority/location", "ưu tiên bài mới"]
+    elif sale_intent:
+        criteria = ["đúng món cần tìm", "giá/tình trạng rõ", "ưu tiên bài mới"]
+    elif review_intent:
+        criteria = ["trải nghiệm thực tế", "nhiều chi tiết", "ít xin ý kiến chung chung"]
+
+    ranked: list[dict[str, Any]] = []
+    for index, item in enumerate(items[:20]):
+        if not isinstance(item, dict):
+            continue
+        blob = "\n".join(
+            [
+                str(item.get("author") or ""),
+                str(item.get("text") or ""),
+                str(item.get("excerpt") or ""),
+                str(item.get("time_hint") or ""),
+                str(item.get("query_used") or ""),
+            ]
+        )
+        hay = blob.lower()
+        score = _score_relevance(base_terms, blob) * 2
+        reasons: list[str] = []
+        is_seeker_post = any(marker in hay for marker in [
+            "mình đang tìm", "em đang tìm", "anh đang tìm", "cần tìm", "can tim",
+            "tìm gấp", "tim gap", "tim phong", "tìm phòng", "tim tro", "tìm trọ",
+            "looking for", "need to find", "xin review", "ai review",
+        ])
+        if any(marker in hay for marker in [" giờ", "gio", "hôm nay", "hom nay", "phút", "phut", "mới", "moi", "today", "hour", "hours"]):
+            score += 1
+            reasons.append("có tín hiệu thời gian mới")
+        if rental_intent:
+            if any(marker in hay for marker in ["cho thuê", "cho thue", "còn phòng", "con phong", "trống phòng", "trong phong", "pass phòng", "pass phong", "ở ghép", "o ghep", "studio"]) and not is_seeker_post:
+                score += 4
+                reasons.append("đúng bài cho thuê")
+            if re.search(r"(\d+[.,]?\d*)\s*(triệu|trieu|k|000)", hay):
+                score += 2
+                reasons.append("có giá cụ thể")
+            if is_seeker_post:
+                score -= 5
+                reasons.append("bài đi tìm thay vì bài đăng cho thuê")
+        elif job_intent:
+            if any(marker in hay for marker in ["tuyển", "tuyen", "hiring", "recruit", "apply", "job description", "jd"]) and not is_seeker_post:
+                score += 4
+                reasons.append("đúng bài tuyển")
+            if is_seeker_post or any(marker in hay for marker in ["mình đang tìm việc", "em đang tìm việc", "looking for job", "tìm cơ hội", "tim viec"]):
+                score -= 6
+                reasons.append("bài ứng viên đi tìm việc")
+        elif sale_intent:
+            if any(marker in hay for marker in ["bán", "ban ", "pass", "thanh lý", "thanh ly", "new", "99%"]) and not is_seeker_post:
+                score += 4
+                reasons.append("đúng bài bán/pass")
+            if is_seeker_post or any(marker in hay for marker in ["cần mua", "tim mua", "tìm mua", "xin pass"]):
+                score -= 4
+                reasons.append("bài người đi tìm mua")
+        elif review_intent:
+            if any(marker in hay for marker in ["review", "trải nghiệm", "trai nghiem", "đánh giá", "danh gia"]) and not is_seeker_post:
+                score += 4
+                reasons.append("có nội dung review")
+            if is_seeker_post or any(marker in hay for marker in ["ai review", "xin review", "cho em xin review"]):
+                score -= 3
+                reasons.append("bài xin review hơn là review thật")
+        verdict = "strong" if score >= 7 else ("medium" if score >= 3 else "weak")
+        reason = "; ".join(reasons[:3]) or "khớp một phần theo từ khóa và ngữ cảnh"
+        ranked.append({"index": index, "score": min(10.0, max(0.0, float(score))), "verdict": verdict, "reason": reason})
+    ranked.sort(key=lambda item: float(item.get("score") or 0), reverse=True)
+    return {
+        "ok": bool(ranked),
+        "intent": compact_text(query, 240),
+        "criteria": criteria,
+        "summary": "Fallback rerank dùng overlap + intent heuristics.",
+        "ranked_items": ranked[: max(1, min(int(top_k or 5), 10))],
+        "raw": "",
+    }
+
+
+def host_browser_rerank(query: str, items: list[dict[str, Any]], top_k: int = 5) -> dict[str, Any]:
+    trimmed_items: list[dict[str, Any]] = []
+    for index, item in enumerate(items[:20]):
+        if not isinstance(item, dict):
+            continue
+        trimmed_items.append(
+            {
+                "index": index,
+                "url": compact_text(str(item.get("url") or ""), 400),
+                "author": compact_text(str(item.get("author") or ""), 160),
+                "text": compact_text(str(item.get("text") or item.get("excerpt") or ""), 1600),
+                "excerpt": compact_text(str(item.get("excerpt") or item.get("text") or ""), 320),
+                "time_hint": compact_text(str(item.get("time_hint") or ""), 160),
+                "query_used": compact_text(str(item.get("query_used") or ""), 200),
+                "score": item.get("score"),
+                "reasons": item.get("reasons") if isinstance(item.get("reasons"), list) else [],
+            }
+        )
+    if not trimmed_items:
+        return {"ok": False, "intent": query, "criteria": [], "summary": "", "ranked_items": []}
+
+    rerank_system_prompt = (
+        "Bạn là bộ xếp hạng candidate bài Facebook theo kiểu trợ lý thông minh. "
+        "Nhiệm vụ: suy ra ý định thật sự từ query, tự quyết tiêu chí phù hợp với ý định đó, "
+        "rồi xếp hạng candidate nào đáng đưa lên đầu. "
+        "Không được mặc định đây là tìm việc; có thể là tìm trọ, mua bán, review, drama, thông báo, dịch vụ hoặc chủ đề khác. "
+        "Ưu tiên bài đáp ứng đúng mục tiêu, thông tin cụ thể, độ mới nếu đọc được ngày/giờ, và loại bỏ bài chỉ liên quan lỏng. "
+        "Trả JSON thuần, không markdown."
+    )
+    rerank_user_prompt = (
+        "Xếp hạng các candidate Facebook sau theo đúng ý định của người dùng.\n"
+        f"User query: {compact_text(query, 500)}\n\n"
+        "Yêu cầu:\n"
+        "- Tự suy ra intent.\n"
+        "- Tự nêu 3-6 tiêu chí xếp hạng ngắn gọn.\n"
+        "- Chỉ dùng index có trong danh sách.\n"
+        "- Ưu tiên bài phù hợp nhất, bài mới hơn nếu có tín hiệu thời gian, và bài có chi tiết thực chất.\n"
+        "- Nếu một bài là sai vai trò/ngược nhu cầu (ví dụ người đi tìm việc thay vì bài tuyển), hạ hạng mạnh.\n\n"
+        'Trả JSON đúng schema: {"intent":"...","criteria":["..."],"summary":"...","ranked_items":[{"index":0,"score":0-10,"verdict":"strong|medium|weak","reason":"..."}]}\n\n'
+        f"Candidates:\n{json.dumps(trimmed_items, ensure_ascii=False)}"
+    )
+    started = time.perf_counter()
+    result = cliproxy_chat(
+        [{"role": "user", "content": rerank_user_prompt}],
+        compose_system_prompt(rerank_system_prompt),
+    )
+    trace_event(
+        "model_call",
+        route="host_browser_rerank",
+        ok=bool(result.get("ok")),
+        elapsed_ms=round((time.perf_counter() - started) * 1000, 2),
+        items=len(trimmed_items),
+    )
+    if not result.get("ok"):
+        fallback = fallback_host_browser_rerank(query, trimmed_items, top_k)
+        fallback["summary"] = compact_text(str(result.get("summary") or fallback.get("summary") or ""), 600)
+        return fallback
+
+    raw = str((result.get("data") or {}).get("content") or "").strip()
+    parsed = parse_json_payload(raw)
+    ranked_entries = parsed.get("ranked_items") if isinstance(parsed.get("ranked_items"), list) else []
+    normalized_ranked: list[dict[str, Any]] = []
+    seen_indexes: set[int] = set()
+    for entry in ranked_entries:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            index = int(entry.get("index"))
+        except (TypeError, ValueError):
+            continue
+        if index < 0 or index >= len(trimmed_items) or index in seen_indexes:
+            continue
+        seen_indexes.add(index)
+        verdict = str(entry.get("verdict") or "medium").strip().lower()
+        if verdict not in {"strong", "medium", "weak"}:
+            verdict = "medium"
+        try:
+            score = float(entry.get("score"))
+        except (TypeError, ValueError):
+            score = 0.0
+        normalized_ranked.append(
+            {
+                "index": index,
+                "score": score,
+                "verdict": verdict,
+                "reason": compact_text(str(entry.get("reason") or ""), 320),
+            }
+        )
+    if not normalized_ranked:
+        fallback = fallback_host_browser_rerank(query, trimmed_items, top_k)
+        fallback["summary"] = compact_text(str(parsed.get("summary") or fallback.get("summary") or ""), 600)
+        fallback["raw"] = raw[:2400]
+        return fallback
+    return {
+        "ok": bool(normalized_ranked),
+        "intent": compact_text(str(parsed.get("intent") or query), 240),
+        "criteria": [compact_text(str(item), 120) for item in (parsed.get("criteria") or [])[:6]],
+        "summary": compact_text(str(parsed.get("summary") or ""), 600),
+        "ranked_items": normalized_ranked[: max(1, min(int(top_k or 5), 10))],
+        "raw": raw[:2400],
+    }
 
 
 def is_duplicate_user_message(job: dict, content: str, window_seconds: int = 3) -> bool:
@@ -2579,7 +3316,56 @@ def model_chat_stream_events(job_id: str, fallback_text: str):
     final = sanitize_manager_content("".join(collected).strip() or casual_reply(fallback_text), casual_reply(fallback_text))
     db.add_message(job_id, "langgraph", final)
     refresh_session_memory(job_id)
-    yield sse_event("done", {"job": db.get_job(job_id)})
+    yield sse_event("done", {"job": hydrate_job_for_ui(db.get_job(job_id) or {})})
+
+
+def job_event_stream(job_id: str):
+    last_seen = ""
+    last_ping = time.monotonic()
+    yield sse_event("connected", {"job_id": job_id, "ts": time.time()})
+    while True:
+        job = db.get_job(job_id)
+        if not job:
+            yield sse_event("error", {"error": "job not found"})
+            return
+        fingerprint = json.dumps(
+            {
+                "updated_at": job.get("updated_at", ""),
+                "status": job.get("status", ""),
+                "message_count": len(job.get("messages", []) or []),
+                "pending_actions": [
+                    (
+                        item.get("id"),
+                        item.get("status"),
+                        item.get("updated_at"),
+                        item.get("result"),
+                        item.get("error"),
+                    )
+                    for item in (job.get("pending_actions") or [])
+                ],
+                "steps": [
+                    (
+                        item.get("name"),
+                        item.get("status"),
+                        item.get("detail"),
+                        item.get("finished_at"),
+                    )
+                    for item in (job.get("steps") or [])
+                ],
+                "result": job.get("result", ""),
+                "error": job.get("error", ""),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        if fingerprint != last_seen:
+            last_seen = fingerprint
+            yield sse_event("job", {"job": hydrate_job_for_ui(job)})
+            last_ping = time.monotonic()
+        elif time.monotonic() - last_ping >= 15:
+            yield sse_event("ping", {"job_id": job_id, "ts": time.time()})
+            last_ping = time.monotonic()
+        time.sleep(0.25)
 
 
 def compute_next_run(schedule: str, from_time: datetime | None = None) -> str:
@@ -2598,6 +3384,19 @@ def compute_next_run(schedule: str, from_time: datetime | None = None) -> str:
     if text == "weekly":
         return (base + timedelta(days=7)).isoformat()
     return ""
+
+
+def host_browser_bridge_url() -> str:
+    return os.getenv("HOST_BROWSER_BRIDGE_URL", "http://host.docker.internal:3342").strip().rstrip("/")
+
+
+def host_browser_call(path: str, payload: dict[str, Any] | None = None, method: str = "POST", timeout: int = 30) -> dict[str, Any]:
+    base = host_browser_bridge_url()
+    if not base:
+        raise RuntimeError("HOST_BROWSER_BRIDGE_URL is empty")
+    verb = method.upper()
+    use_payload = payload if verb != "GET" else None
+    return http_json(verb, f"{base}{path}", payload=use_payload, timeout=timeout)
 
 
 def queue_due_recurring_tasks() -> list[dict]:
@@ -2667,6 +3466,30 @@ def seed_operating_defaults() -> None:
             "create_skill",
             {"name": "{{input}}", "description": "Skill draft from /skill", "triggers": "{{input}}", "source": "slash-command", "body": "# {{input}}\n\n## Workflow\n- Define the repeatable steps.\n- Add safety checks.\n- Add verification."},
         ),
+        (
+            "browser",
+            "Focus browser hiện có nếu đang mở rồi tạo tab mới; nếu chưa có thì tự mở browser host",
+            "host_browser_open_current",
+            {"url": "{{input}}", "browser": "brave"},
+        ),
+        (
+            "facebook",
+            "Focus Brave hiện có rồi mở Facebook bằng session local; nếu chưa có thì tự mở",
+            "host_browser_open_current",
+            {"url": "https://www.facebook.com/", "browser": "brave"},
+        ),
+        (
+            "facebook-research",
+            "Research bài viết Facebook bằng browser debug visible với profile persistent",
+            "host_browser_facebook_research",
+            {"query": "{{input}}", "browser": "brave", "port": 9222, "limit": 8, "scroll_rounds": 4},
+        ),
+        (
+            "hostshot",
+            "Chụp màn hình host để xác nhận browser/UI đang hiển thị gì",
+            "host_browser_screenshot",
+            {"name": "host_capture_{{job_id}}.png", "full_screen": False},
+        ),
     ]
     for name, description, kind, payload in default_commands:
         existing = db.get_command(name)
@@ -2733,6 +3556,137 @@ def network_info():
     for ip in sorted(addresses):
         urls.append(f"http://{ip}:8899")
     return {"ok": True, "hostname": hostname, "urls": list(dict.fromkeys(urls))}
+
+
+@app.get("/api/host-browser/health")
+def host_browser_health():
+    bridge = host_browser_bridge_url()
+    try:
+        data = host_browser_call("/health", method="GET")
+        return {"ok": True, "bridge_url": bridge, "bridge": data}
+    except Exception as exc:
+        return {"ok": False, "bridge_url": bridge, "error": str(exc)}
+
+
+@app.get("/api/host-browser/browsers")
+def host_browser_browsers():
+    try:
+        data = host_browser_call("/browsers", method="GET")
+        return {"ok": True, "bridge_url": host_browser_bridge_url(), **data}
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
+@app.post("/api/host-browser/open-url")
+def host_browser_open(payload: HostBrowserOpenRequest):
+    try:
+        data = host_browser_call("/open-url", payload.model_dump())
+        return {"ok": True, "bridge_url": host_browser_bridge_url(), **data}
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
+@app.post("/api/host-browser/open-current")
+def host_browser_open_current(payload: HostBrowserOpenCurrentRequest):
+    try:
+        data = host_browser_call("/open-current", payload.model_dump())
+        return {"ok": True, "bridge_url": host_browser_bridge_url(), **data}
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
+@app.post("/api/host-browser/launch-debug")
+def host_browser_launch(payload: HostBrowserLaunchRequest):
+    try:
+        data = host_browser_call("/launch-debug", payload.model_dump())
+        return {"ok": True, "bridge_url": host_browser_bridge_url(), **data}
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
+@app.post("/api/host-browser/facebook-research")
+def host_browser_facebook_research(payload: HostBrowserFacebookResearchRequest):
+    try:
+        data = host_browser_call("/facebook-research", payload.model_dump(), timeout=240)
+        return {"ok": True, "bridge_url": host_browser_bridge_url(), **data}
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
+@app.post("/api/host-browser/facebook-search-plan")
+def host_browser_facebook_search_plan(payload: HostBrowserSearchPlanRequest):
+    data = host_browser_search_plan(payload.query, payload.max_queries)
+    return {
+        "ok": bool(data.get("ok")),
+        "summary": data.get("summary") or "Facebook search plan ready",
+        "data": data,
+    }
+
+
+@app.post("/api/host-browser/facebook-rerank")
+def host_browser_facebook_rerank(payload: HostBrowserRerankRequest):
+    data = host_browser_rerank(payload.query, payload.items, payload.top_k)
+    return {
+        "ok": bool(data.get("ok")),
+        "summary": data.get("summary") or ("Facebook candidates reranked" if data.get("ok") else "Facebook rerank unavailable"),
+        "data": data,
+    }
+
+
+@app.post("/api/host-browser/screenshot")
+def host_browser_screenshot(payload: HostBrowserScreenshotRequest):
+    try:
+        data = host_browser_call("/screenshot", payload.model_dump())
+        return {"ok": True, "bridge_url": host_browser_bridge_url(), **data}
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
+@app.post("/api/host-browser/ocr-extract")
+def host_browser_ocr_extract(payload: HostBrowserOcrExtractRequest):
+    system_prompt = (
+        "Bạn là OCR/vision extractor cho Facebook research. "
+        "Chỉ đọc phần bài viết đang hiển thị trong ảnh. "
+        "Ưu tiên nội dung bài, bỏ phần UI nhiễu nếu có thể. "
+        'Trả JSON thuần {"text":"...","confidence":"high|medium|low","reason":"...","needs_more_context":false}.'
+    )
+    user_prompt = (
+        "Trích xuất nội dung chữ nhìn thấy từ ảnh chụp bài Facebook này.\n"
+        f"- user query: {compact_text(payload.query, 240)}\n"
+        f"- page title: {compact_text(payload.title, 200)}\n"
+        f"- page url: {compact_text(payload.url, 300)}\n"
+        f"- DOM excerpt hiện có (có thể thiếu): {compact_text(payload.excerpt, 500)}\n"
+        "Nếu ảnh không đủ rõ, vẫn trả phần đọc được tốt nhất, không suy diễn."
+    )
+    result = cliproxy_vision(
+        prompt=user_prompt,
+        image_base64=payload.image_base64,
+        mime_type=payload.mime_type or "image/png",
+        system_prompt=compose_system_prompt(system_prompt),
+    )
+    if not result.get("ok"):
+        return {
+            "ok": False,
+            "summary": result.get("summary") or "OCR extract failed",
+            "data": {"text": "", "confidence": "low", "reason": "vision-call-failed"},
+        }
+    content = str((result.get("data") or {}).get("content") or "").strip()
+    parsed = parse_json_payload(content)
+    text = compact_text(str(parsed.get("text") or content), 8000).strip()
+    confidence = str(parsed.get("confidence") or "medium").strip().lower()
+    if confidence not in {"high", "medium", "low"}:
+        confidence = "medium"
+    return {
+        "ok": bool(text),
+        "summary": "OCR extracted text" if text else "OCR returned empty text",
+        "data": {
+            "text": text,
+            "confidence": confidence,
+            "reason": str(parsed.get("reason") or "").strip(),
+            "needs_more_context": bool(parsed.get("needs_more_context")),
+            "raw": content[:2000],
+        },
+    }
 
 
 @app.get("/api/memories")
@@ -3360,7 +4314,7 @@ def get_job(job_id: str):
     job = db.get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="job not found")
-    return {"job": job}
+    return {"job": hydrate_job_for_ui(job)}
 
 
 @app.get("/api/jobs/{job_id}/session-memory")
@@ -3496,6 +4450,17 @@ def add_message_stream(job_id: str, payload: MessageRequest):
     db.add_message(job_id, "user", payload.content)
     return StreamingResponse(
         model_chat_stream_events(job_id, payload.content),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.get("/api/jobs/{job_id}/events")
+def stream_job_events(job_id: str):
+    if not db.get_job(job_id):
+        raise HTTPException(status_code=404, detail="job not found")
+    return StreamingResponse(
+        job_event_stream(job_id),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
