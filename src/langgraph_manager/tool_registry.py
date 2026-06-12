@@ -24,6 +24,59 @@ class ToolSpec:
     fn: ToolFn
 
 
+def detect_tool_error_class(text: str) -> str:
+    raw = str(text or "").lower()
+    if "unknown tool" in raw:
+        return "unknown_tool"
+    if "permission gate blocked" in raw or "permission denied" in raw:
+        return "permission_denied"
+    if "timed out" in raw or "timeout" in raw:
+        return "timeout"
+    if "command not found" in raw:
+        return "command_not_found"
+    if "does not exist" in raw or "not found" in raw:
+        return "missing_resource"
+    if "not a git repository" in raw or "not a git repo" in raw:
+        return "git_unavailable"
+    return "runtime_error"
+
+
+def normalize_tool_result(name: str, result: dict[str, Any] | None) -> dict[str, Any]:
+    raw = dict(result or {})
+    ok = bool(raw.get("ok"))
+    summary = str(raw.get("summary") or "").strip()
+    data = raw.get("data") if isinstance(raw.get("data"), dict) else {}
+    if not summary:
+        fallback = str(raw.get("error") or data.get("error") or data.get("output") or "").strip()
+        summary = fallback[:300] if fallback else ("Tool completed" if ok else "Tool failed")
+    evidence = {
+        "has_data": bool(data),
+        "has_output": bool(str(data.get("output") or "").strip()),
+        "artifact_url": str(data.get("artifact_url") or "").strip(),
+    }
+    error_blob = "\n".join(
+        part for part in [
+            summary,
+            str(raw.get("error") or ""),
+            str(data.get("error") or ""),
+            str(data.get("output") or ""),
+        ]
+        if str(part or "").strip()
+    )
+    normalized = {
+        "name": name,
+        "ok": ok,
+        "summary": summary,
+        "data": data,
+        "evidence": evidence,
+        "error_class": "" if ok else detect_tool_error_class(error_blob),
+    }
+    for key, value in raw.items():
+        if key not in normalized:
+            normalized[key] = value
+    return normalized
+
+
 def _run(args: list[str], cwd: str | None = None, timeout: int = 20) -> dict[str, Any]:
     try:
         proc = subprocess.run(
@@ -864,9 +917,9 @@ TOOLS: dict[str, ToolSpec] = {
 def run_tool(name: str, context: dict[str, Any]) -> dict[str, Any]:
     spec = TOOLS.get(name)
     if not spec:
-        return {"ok": False, "summary": f"Unknown tool: {name}", "data": {}}
+        return normalize_tool_result(name, {"ok": False, "summary": f"Unknown tool: {name}", "data": {}})
     result = spec.fn(context)
-    return {"name": name, **result}
+    return normalize_tool_result(name, result)
 
 
 def describe_tools() -> list[dict[str, str]]:

@@ -459,6 +459,24 @@ export default function App() {
     try {
       if (decision === 'approve') {
         pollBurstUntilRef.current = Date.now() + 4000;
+        if (activeJob) {
+          const optimisticRunningAction = (activeJob.pending_actions || []).map(action =>
+            String(action.id) === id
+              ? {
+                  ...action,
+                  status: 'running',
+                  updated_at: new Date().toISOString(),
+                }
+              : action,
+          );
+          const optimisticRunningJob: BackendJob = {
+            ...activeJob,
+            updated_at: new Date().toISOString(),
+            pending_actions: optimisticRunningAction,
+          };
+          setActiveJob(optimisticRunningJob);
+          upsertJobLocally(optimisticRunningJob);
+        }
       }
       const job = decision === 'approve' ? await approveAction(id) : await rejectAction(id);
       await updateActiveJob(job);

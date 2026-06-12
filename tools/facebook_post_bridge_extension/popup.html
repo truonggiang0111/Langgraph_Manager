@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Facebook Post Bridge</title>
+    <style>
+      body {
+        margin: 0;
+        padding: 12px;
+        width: 380px;
+        font: 13px/1.45 ui-sans-serif, system-ui, sans-serif;
+        background: #111;
+        color: #f3f3f3;
+      }
+      .row { display: flex; gap: 8px; margin-bottom: 10px; }
+      input, button, textarea {
+        font: inherit;
+        border-radius: 10px;
+        border: 1px solid #333;
+        background: #1b1b1b;
+        color: inherit;
+      }
+      input { flex: 1; padding: 10px; }
+      button { padding: 10px 12px; cursor: pointer; }
+      button.primary { background: #2b6cf6; border-color: #2b6cf6; }
+      .meta { color: #a9a9a9; font-size: 12px; margin-bottom: 10px; }
+      .list { display: grid; gap: 8px; max-height: 420px; overflow: auto; }
+      .card {
+        border: 1px solid #282828;
+        border-radius: 12px;
+        padding: 10px;
+        background: #171717;
+      }
+      .title { font-weight: 700; margin-bottom: 4px; }
+      .summary { color: #d3d3d3; font-size: 12px; }
+      .small { color: #9a9a9a; font-size: 11px; margin-top: 6px; }
+      .actions { display: flex; gap: 8px; margin-top: 8px; }
+      .actions button { padding: 6px 8px; font-size: 12px; }
+      #status { min-height: 18px; margin-bottom: 8px; color: #9ed0ff; }
+      textarea { width: 100%; min-height: 80px; padding: 8px; resize: vertical; }
+    </style>
+  </head>
+  <body>
+    <div class="row">
+      <input id="query" placeholder="intern devops hcm">
+      <button id="scan" class="primary">Scan</button>
+      <button id="scroll-scan">Scroll + Scan</button>
+    </div>
+    <div id="status"></div>
+    <div class="meta" id="meta"></div>
+    <div class="row">
+      <button id="copy-json">Copy JSON</button>
+      <button id="copy-text">Copy Top Text</button>
+      <button id="send-local">Send Local</button>
+    </div>
+    <div class="list" id="results"></div>
+    <textarea id="output" placeholder="Resolved text will appear here..."></textarea>
+    <script src="popup.js"></script>
+  </body>
+  </html>

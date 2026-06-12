@@ -198,11 +198,57 @@ function parseVerificationFromText(text: string): { hardGateOk?: boolean; missin
 function parseFacebookResearchResult(raw?: string): Action['facebookResearch'] | undefined {
   if (!raw) return undefined;
   try {
+    const compact = (value: unknown, max = 180): string => {
+      const text = String(value || '').replace(/\s+/g, ' ').trim();
+      if (!text) return '';
+      return text.length > max ? `${text.slice(0, Math.max(0, max - 1)).trimEnd()}…` : text;
+    };
+    const cleanInline = (value: unknown): string => String(value || '')
+      .replace(/https?:\/\/\S+/gi, ' ')
+      .replace(/[#*_`[\]()]+/g, ' ')
+      .replace(/\b(?:sorntpoeSd|tpdoSeorsnnu|tpdoSeornsnu)\S*/gi, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    const deriveTitle = (item: any, index: number): string => {
+      const base = cleanInline(item.display_title || item.author || item.summary || item.text || item.image_text || `Bài ${index + 1}`);
+      return compact(base, 90) || `Bài ${index + 1}`;
+    };
+    const deriveSummary = (item: any): string => {
+      const base = cleanInline(item.display_summary || item.summary || item.text || item.image_text || '');
+      return compact(base, 180);
+    };
+    const scoreFallback = (item: any): number => {
+      const hay = `${item.text || ''} ${item.summary || ''} ${item.author || ''}`.toLowerCase();
+      let score = Number(item.score || 0);
+      if (/(devops|cloud|platform|sre|infra)/.test(hay)) score += 30;
+      if (/(intern|thực tập|thuc tap|fresher|junior)/.test(hay)) score += 20;
+      if (/(tp\.?\s*hcm|tphcm|hcm|hồ chí minh|ho chi minh|sài gòn|sai gon)/.test(hay)) score += 20;
+      if (/(hà nội|ha noi|hanoi|\bhn\b)/.test(hay) && !/(tp\.?\s*hcm|tphcm|hcm|hồ chí minh|ho chi minh|sài gòn|sai gon)/.test(hay)) score -= 50;
+      if (/(tổng hợp|tong hop|forum|box việc làm|box viec lam)/.test(hay)) score -= 15;
+      return score;
+    };
     const parsed = JSON.parse(raw);
-    const data = parsed?.result ?? parsed?.data;
+    const firstLayer = parsed?.result ?? parsed?.data ?? parsed;
+    const data = firstLayer?.result ?? firstLayer?.data ?? firstLayer;
     if (!data || typeof data !== 'object') return undefined;
     const summary = typeof data.summary === 'object' && data.summary ? data.summary : {};
-    const results = Array.isArray(data.results) ? data.results : [];
+    const topItems = Array.isArray((data as any).top_items) ? (data as any).top_items : [];
+    const directResults = Array.isArray((data as any).results) ? (data as any).results : [];
+    const results = directResults.length
+      ? directResults
+      : topItems
+          .map((item: any, index: number) => ({
+            rank: index + 1,
+            author: deriveTitle(item, index),
+            summary: deriveSummary(item),
+            keep_reason: '',
+            time_status: '',
+            url: String(item.url || item.link || item.photoOnlyUrl || item.photo_only_url || ''),
+            raw_url: String(item.raw_url || item.url || item.link || item.photoOnlyUrl || item.photo_only_url || ''),
+            __fallback_score: scoreFallback(item),
+          }))
+          .sort((left: any, right: any) => Number(right.__fallback_score || 0) - Number(left.__fallback_score || 0))
+          .map((item: any, index: number) => ({ ...item, rank: index + 1 }));
     if (!results.length) return undefined;
     const recentConfirmed = Number((summary as any).recent_confirmed_count || 0);
     const timeUnknown = Number((summary as any).time_unknown_count || 0);
@@ -210,6 +256,13 @@ function parseFacebookResearchResult(raw?: string): Action['facebookResearch'] |
     const parts: string[] = [];
     if (recentConfirmed) parts.push(`${recentConfirmed} bài xác nhận còn mới`);
     if (staleConfirmed) parts.push(`${staleConfirmed} bài xác nhận quá cũ`);
+    if (!parts.length && typeof (summary as any).rerank_summary === 'string' && (summary as any).rerank_summary.trim()) {
+      parts.push(String((summary as any).rerank_summary).trim());
+    }
+    if (!parts.length && Array.isArray((data as any).query_results)) {
+      const tabCount = (data as any).query_results.filter((item: any) => Number(item?.total_found || 0) > 0).length;
+      if (tabCount > 0) parts.push(`${tabCount} tab có kết quả`);
+    }
     return {
       summaryText: parts.join(', '),
       counts: {
@@ -219,12 +272,12 @@ function parseFacebookResearchResult(raw?: string): Action['facebookResearch'] |
       },
       items: results.slice(0, 10).map((item: any, index: number) => ({
         rank: Number(item.rank || index + 1),
-        author: String(item.author || `Bài ${index + 1}`),
-        summary: String(item.summary || ''),
+        author: compact(String(item.author || `Bài ${index + 1}`), 90),
+        summary: compact(String(item.summary || ''), 180),
         keepReason: String(item.keep_reason || item.llm_reason || ''),
         timeStatus: String(item.time_status || item.time_bucket || ''),
-        url: String(item.url || ''),
-        rawUrl: String(item.raw_url || ''),
+        url: String(item.url || item.link || item.photoOnlyUrl || item.photo_only_url || ''),
+        rawUrl: String(item.raw_url || item.url || item.link || item.photoOnlyUrl || item.photo_only_url || ''),
       })),
     };
   } catch {
@@ -280,7 +333,7 @@ export function mapJobToActions(job: BackendJob | null): Action[] {
   }
 
   const hasPlanCard = Boolean(job.plan?.length);
-  if ((job.status === 'running' || job.steps?.some(step => step.status === 'running')) && !actions.some(a => a.status === 'running') && !hasPlanCard) {
+  if (job.status === 'running' && !actions.some(a => a.status === 'running') && !hasPlanCard) {
     const step = job.steps?.find(s => s.status === 'running') || job.steps?.at(-1);
     actions.push({
       id: `running-${job.id}`,
@@ -407,6 +460,18 @@ export function mapJobToMessages(job: BackendJob): Message[] {
 
   if (completedFacebookActions.length > 0) {
     const latestFacebookAction = completedFacebookActions[completedFacebookActions.length - 1];
+    const latestFacebookTs = latestFacebookAction.timestamp.getTime();
+    const hasNewerNonFacebookAction = actions.some(
+      action =>
+        action.id !== latestFacebookAction.id
+        && action.kind !== 'host_browser_facebook_research'
+        && action.timestamp.getTime() > latestFacebookTs,
+    );
+
+    if (hasNewerNonFacebookAction) {
+      return messages;
+    }
+
     const lastAssistantIndex = [...messages]
       .map((message, index) => ({ message, index }))
       .reverse()

@@ -35,3 +35,16 @@ def test_memory_context_includes_user_preferences_and_session_sync(tmp_path, mon
         assert "user_preferences:" in context
         assert "last_active_job_id" in context
         assert "last_permission_mode" in context
+
+
+def test_refresh_session_memory_compacts_recent_duplicate_lines(tmp_path, monkeypatch):
+    monkeypatch.setenv("LANGGRAPH_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(app_module, "cliproxy_chat", lambda messages, system_prompt="": {"ok": False, "data": {}})
+    with TestClient(app) as client:
+        created = client.post("/api/chats").json()["job"]
+        job_id = created["id"]
+        for _ in range(6):
+            client.post(f"/api/jobs/{job_id}/messages", json={"content": "nhớ giúp tôi cách làm việc thật ngắn gọn"})
+        memory = client.get(f"/api/jobs/{job_id}/session-memory").json()["session_memory"]
+        assert len(memory["summary"]) <= 3000
+        assert memory["summary"].count("nhớ giúp tôi cách làm việc thật ngắn gọn") <= 2

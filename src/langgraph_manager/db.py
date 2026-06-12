@@ -13,6 +13,19 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _sanitize_text(value: Any) -> str:
+    text = "" if value is None else str(value)
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        text = text.encode("utf-8", errors="replace").decode("utf-8")
+    return text
+
+
+def _sanitize_json(value: Any) -> str:
+    return _sanitize_text(json.dumps(value, ensure_ascii=False))
+
+
 def default_db_path() -> Path:
     state_dir = Path(os.getenv("LANGGRAPH_STATE_DIR", "/data/state"))
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -42,7 +55,7 @@ def init_db() -> None:
               request TEXT NOT NULL,
               status TEXT NOT NULL,
               plan_json TEXT NOT NULL DEFAULT '[]',
-              permission_mode TEXT NOT NULL DEFAULT 'auto_review',
+              permission_mode TEXT NOT NULL DEFAULT 'full_access',
               result TEXT NOT NULL DEFAULT '',
               error TEXT NOT NULL DEFAULT '',
               created_at TEXT NOT NULL,
@@ -120,6 +133,12 @@ def init_db() -> None:
               important_files TEXT NOT NULL DEFAULT '',
               decisions TEXT NOT NULL DEFAULT '',
               last_result TEXT NOT NULL DEFAULT '',
+              updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS job_runtime_meta (
+              job_id TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+              verification_json TEXT NOT NULL DEFAULT '{}',
               updated_at TEXT NOT NULL
             );
 
@@ -265,7 +284,7 @@ def init_db() -> None:
         )
         columns = {row["name"] for row in con.execute("PRAGMA table_info(jobs)").fetchall()}
         if "permission_mode" not in columns:
-            con.execute("ALTER TABLE jobs ADD COLUMN permission_mode TEXT NOT NULL DEFAULT 'auto_review'")
+            con.execute("ALTER TABLE jobs ADD COLUMN permission_mode TEXT NOT NULL DEFAULT 'full_access'")
 
 
 def row_to_job(row: sqlite3.Row) -> dict[str, Any]:
@@ -280,7 +299,7 @@ def create_job(
     request: str,
     plan: list[str],
     status: str = "planned",
-    permission_mode: str = "auto_review",
+    permission_mode: str = "full_access",
     manager_message: str = "Đã tạo plan nháp. Chờ approve trước khi chạy.",
 ) -> dict[str, Any]:
     ts = now_iso()
@@ -305,7 +324,7 @@ def create_job(
         return row_to_job(row)
 
 
-def get_or_create_chat(job_id: str = "main_chat", permission_mode: str = "auto_review") -> dict[str, Any]:
+def get_or_create_chat(job_id: str = "main_chat", permission_mode: str = "full_access") -> dict[str, Any]:
     with connect() as con:
         row = con.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
         if row:
@@ -326,7 +345,7 @@ def get_or_create_chat(job_id: str = "main_chat", permission_mode: str = "auto_r
         return row_to_job(row)
 
 
-def create_chat_session(job_id: str, title: str = "New session", permission_mode: str = "auto_review") -> dict[str, Any]:
+def create_chat_session(job_id: str, title: str = "New session", permission_mode: str = "full_access") -> dict[str, Any]:
     ts = now_iso()
     with connect() as con:
         con.execute(
@@ -404,7 +423,7 @@ def get_job(job_id: str) -> dict[str, Any] | None:
             datetime.now(timezone.utc).timestamp() - 180,
             tz=timezone.utc,
         ).isoformat()
-        job["pending_actions"] = [
+        pending_actions = [
             row_to_pending_action(r)
             for r in con.execute(
                 """
@@ -419,27 +438,35 @@ def get_job(job_id: str) -> dict[str, Any] | None:
                 (job_id, recent_terminal_cutoff),
             )
         ]
-        has_recent_facebook_done = any(
-            str(item.get("kind") or "") == "host_browser_facebook_research"
-            and str(item.get("status") or "") == "done"
-            for item in job["pending_actions"]
-        )
-        if not has_recent_facebook_done:
-            latest_facebook_done = con.execute(
+        has_open_action = any(str(item.get("status") or "") in {"pending", "running"} for item in pending_actions)
+        if not has_open_action:
+            latest_terminal = con.execute(
                 """
                 SELECT * FROM pending_actions
                 WHERE job_id = ?
-                  AND kind = 'host_browser_facebook_research'
-                  AND status = 'done'
+                  AND status IN ('done','failed','rejected')
                 ORDER BY id DESC
                 LIMIT 1
                 """,
                 (job_id,),
             ).fetchone()
-            if latest_facebook_done:
-                job["pending_actions"].append(row_to_pending_action(latest_facebook_done))
+            if latest_terminal:
+                latest_terminal_action = row_to_pending_action(latest_terminal)
+                latest_id = latest_terminal_action.get("id")
+                if not any(item.get("id") == latest_id for item in pending_actions):
+                    pending_actions.append(latest_terminal_action)
+                    pending_actions.sort(key=lambda item: int(item.get("id") or 0))
+        job["pending_actions"] = pending_actions
         memory = con.execute("SELECT * FROM session_memory WHERE job_id = ?", (job_id,)).fetchone()
         job["session_memory"] = dict(memory) if memory else default_session_memory(job_id)
+        runtime_meta = con.execute("SELECT verification_json FROM job_runtime_meta WHERE job_id = ?", (job_id,)).fetchone()
+        if runtime_meta:
+            try:
+                job["verification"] = json.loads(runtime_meta["verification_json"] or "{}")
+            except json.JSONDecodeError:
+                job["verification"] = {}
+        else:
+            job["verification"] = {}
         return job
 
 
@@ -472,6 +499,12 @@ def upsert_session_memory(
     last_result: str = "",
 ) -> dict[str, Any]:
     ts = now_iso()
+    summary = _sanitize_text(summary)
+    current_goal = _sanitize_text(current_goal)
+    open_tasks = _sanitize_text(open_tasks)
+    important_files = _sanitize_text(important_files)
+    decisions = _sanitize_text(decisions)
+    last_result = _sanitize_text(last_result)
     with connect() as con:
         con.execute(
             """
@@ -563,6 +596,8 @@ def fail_running_jobs_on_startup() -> int:
 
 def add_message(job_id: str, role: str, content: str) -> None:
     ts = now_iso()
+    role = _sanitize_text(role)
+    content = _sanitize_text(content)
     with connect() as con:
         con.execute(
             "INSERT INTO job_messages (job_id, role, content, created_at) VALUES (?, ?, ?, ?)",
@@ -577,6 +612,16 @@ def row_to_pending_action(row: sqlite3.Row) -> dict[str, Any]:
         data["payload"] = json.loads(data.pop("payload_json") or "{}")
     except json.JSONDecodeError:
         data["payload"] = {}
+    for field in ("result", "error"):
+        raw = str(data.get(field) or "").strip()
+        if not raw:
+            continue
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            data[f"{field}_payload"] = parsed
     return data
 
 
@@ -603,6 +648,9 @@ def get_pending_action(action_id: int) -> dict[str, Any] | None:
 
 def update_pending_action_status(action_id: int, status: str, result: str = "", error: str = "") -> bool:
     ts = now_iso()
+    status = _sanitize_text(status)
+    result = _sanitize_text(result)
+    error = _sanitize_text(error)
     with connect() as con:
         cur = con.execute(
             """
@@ -666,14 +714,34 @@ def clear_job_run_state(job_id: str) -> None:
     with connect() as con:
         con.execute("UPDATE jobs SET result = '', error = '', updated_at = ? WHERE id = ?", (ts, job_id))
         con.execute("DELETE FROM job_steps WHERE job_id = ?", (job_id,))
+        con.execute("DELETE FROM job_runtime_meta WHERE job_id = ?", (job_id,))
 
 
 def update_job_status(job_id: str, status: str, result: str = "", error: str = "") -> None:
     ts = now_iso()
+    status = _sanitize_text(status)
+    result = _sanitize_text(result)
+    error = _sanitize_text(error)
     with connect() as con:
         con.execute(
             "UPDATE jobs SET status = ?, result = COALESCE(NULLIF(?, ''), result), error = ?, updated_at = ? WHERE id = ?",
             (status, result, error, ts, job_id),
+        )
+
+
+def upsert_job_verification(job_id: str, verification: dict[str, Any] | None) -> None:
+    ts = now_iso()
+    payload = _sanitize_json(verification or {})
+    with connect() as con:
+        con.execute(
+            """
+            INSERT INTO job_runtime_meta (job_id, verification_json, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(job_id) DO UPDATE SET
+              verification_json = excluded.verification_json,
+              updated_at = excluded.updated_at
+            """,
+            (job_id, payload, ts),
         )
 
 
@@ -683,6 +751,9 @@ def approve_job(job_id: str) -> None:
 
 def update_step(job_id: str, name: str, status: str, detail: str = "") -> None:
     ts = now_iso()
+    name = _sanitize_text(name)
+    status = _sanitize_text(status)
+    detail = _sanitize_text(detail)
     with connect() as con:
         if status == "running":
             cur = con.execute(

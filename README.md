@@ -4,12 +4,18 @@ Local LangGraph scaffold for the new AI management layer.
 
 n8n should stay as a dispatcher for Telegram/media automation. The old `/dev` orchestration in n8n has been removed from the active Telegram bridge.
 
+## Architecture Docs
+
+- `docs/TARGET_ARCHITECTURE.md`: source of truth for the chosen system direction
+- `docs/PHASES_1_3_EXECUTION.md`: execution contract for the first three phases
+- `docs/openclaw-assistant-phases.md`: broader phase overview toward an OpenClaw-like assistant
+
 ## Run
 
 Docker:
 
-```powershell
-cd D:\User\File\LangGraph_Manager
+```bash
+cd /home/giang/Work/AgentStack/LangGraph_Manager/LangGraph_Manager
 docker compose up -d --build
 ```
 
@@ -21,17 +27,38 @@ http://localhost:8899
 
 Health:
 
-```powershell
-Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8899/api/health
+```bash
+curl http://127.0.0.1:8899/api/health
 ```
+
+## Host Worker
+
+If you want LangGraph to manage the real host machine, keep the Docker app as the brain and run the host worker on the machine itself.
+
+Install `langgraph-host-worker.service` for the current user:
+
+```bash
+cd /home/giang/Work/AgentStack/LangGraph_Manager/LangGraph_Manager
+./tools/install_host_worker_service.sh
+```
+
+Check worker health:
+
+```bash
+curl http://127.0.0.1:3342/health
+curl http://127.0.0.1:8899/api/host-worker/health
+```
+
+The host worker on `3342` now serves browser, shell, files, processes, Docker, service status/logs, and screenshots for LangGraph.
 
 Local Python:
 
-```powershell
-cd D:\User\File\LangGraph_Manager
+```bash
+cd /home/giang/Work/AgentStack/LangGraph_Manager/LangGraph_Manager
 python -m venv .venv
-.\.venv\Scripts\pip install -e .[dev]
-.\.venv\Scripts\python -m langgraph_manager.cli "kiem tra he thong"
+source .venv/bin/activate
+pip install -e .[dev]
+python -m langgraph_manager.cli "kiem tra he thong"
 ```
 
 ## Shape
@@ -83,24 +110,24 @@ Current native tools:
 
 List tools:
 
-```powershell
-Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8899/api/tools
+```bash
+curl http://127.0.0.1:8899/api/tools
 ```
 
 Optional external connectivity check:
 
-```powershell
-Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8899/api/tools/health
+```bash
+curl http://127.0.0.1:8899/api/tools/health
 ```
 
 Configured Claude executor:
 
-```powershell
-CLAUDE_EXECUTOR_COMMAND="docker run --rm -i --user node -e HOME=/home/node -e ANTHROPIC_BASE_URL=http://host.docker.internal:8082 -e ANTHROPIC_AUTH_TOKEN=freecc -e ANTHROPIC_API_KEY=freecc -e CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1 -v D:/User/File:/workspace -v D:/User/File/ClaudeHome:/home/node/.claude -v D:/User/File/ClaudeHome/.claude.json:/home/node/.claude.json -w /workspace/LangGraph_Manager claude-executor-mcp:local -p --model claude-sonnet-4-5-20250929 --permission-mode bypassPermissions --tools default --add-dir /workspace --output-format text"
+```bash
+CLAUDE_EXECUTOR_COMMAND="docker run --rm -i --entrypoint /usr/local/bin/claude-executor-entrypoint --user node --group-add 0 --add-host host.docker.internal:host-gateway -e HOME=/home/node -e CLAUDE_CONFIG_DIR=/home/node/.claude -e NPM_CONFIG_CACHE=/home/node/.npm -e SSH_SOURCE_DIR=/ssh-host -e ANTHROPIC_BASE_URL=http://host.docker.internal:8082 -e ANTHROPIC_AUTH_TOKEN=freecc -e ANTHROPIC_API_KEY=freecc -e CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1 -e GIT_SSH_COMMAND=ssh -v /var/run/docker.sock:/var/run/docker.sock -v /home/giang/Work/AgentStack:/workspace -v /home/giang/Work/AgentStack/ClaudeHome/ClaudeHome:/home/node/.claude -v /home/giang/Work/AgentStack/ClaudeHome/ClaudeHome/.claude.json:/home/node/.claude.json -v /home/giang/.ssh:/ssh-host:ro -w /workspace/LangGraph_Manager/LangGraph_Manager claude-executor-mcp:local -p --model gpt-5.5 --permission-mode bypassPermissions --tools default --add-dir /workspace --add-dir /workspace/LangGraph_Manager/LangGraph_Manager --output-format text"
 CLAUDE_EXECUTOR_TIMEOUT=900
 ```
 
-LangGraph chat/routing uses `CLIPROXY_CHAT_MODEL=gpt-5.4`. Plan mode uses `CLIPROXY_PLAN_MODEL=gpt-5.5`. Code mode sends work directly to the Dockerized Claude Code executor, currently `--model gpt-5.4`, for code/workspace work. It reads the task prompt from stdin, edits the mounted workspace, and keeps Claude Code config/plugins under `D:/User/File/ClaudeHome` for reuse across executor runs. LangGraph mounts that same ClaudeHome read-only at `/claude-home`, builds a shared skill/plugin index from it, and sends ranked routing to Claude with progressive loading hints: start with the first tool for simple tasks, or the first two for composite tasks, then expand only if those are insufficient. The executor runs as the image's non-root `node` user because Claude Code refuses `bypassPermissions` under root. `D:/User/File/ClaudeHome/.claude.json` is also mounted because Claude Code stores marketplace/plugin metadata there. The native engineering graph will use it when the command is configured or the request explicitly asks for Claude/coding-agent delegation.
+LangGraph chat/routing uses `CLIPROXY_CHAT_MODEL=gpt-5.5`. Plan mode uses `CLIPROXY_PLAN_MODEL=gpt-5.5`. Code mode sends work directly to the Dockerized Claude Code executor, currently `--model gpt-5.5`, for code/workspace work. It reads the task prompt from stdin, edits the mounted workspace, and keeps Claude Code config/plugins under `/home/giang/Work/AgentStack/ClaudeHome/ClaudeHome` for reuse across executor runs. LangGraph mounts that same ClaudeHome read-only at `/claude-home`, builds a shared skill/plugin index from it, and sends ranked routing to Claude with progressive loading hints: start with the first tool for simple tasks, or the first two for composite tasks, then expand only if those are insufficient. The executor runs as the image's `node` user with `HOME=/home/node`; on this machine `node` is `uid=1000`, so host workspace and ClaudeHome should be owned by `giang:giang` to keep `bypassPermissions` usable without falling back to container `root`. `/home/giang/Work/AgentStack/ClaudeHome/ClaudeHome/.claude.json` is also mounted because Claude Code stores marketplace/plugin metadata there. The native engineering graph will use it when the command is configured or the request explicitly asks for Claude/coding-agent delegation.
 
 Skill/plugin discovery endpoints:
 

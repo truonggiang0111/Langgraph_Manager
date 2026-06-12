@@ -31,14 +31,14 @@ Use this file when you need to orient in the repo without scanning everything.
 
 Host:
 
-- Repo: `D:/User/File/LangGraph_Manager`
-- Workspace root mounted to executor: `D:/User/File` -> `/workspace`
-- Claude config: `D:/User/File/ClaudeHome`
+- Repo: `/home/giang/Work/AgentStack/LangGraph_Manager/LangGraph_Manager`
+- Workspace root mounted to executor: `/home/giang/Work/AgentStack` -> `/workspace`
+- Claude config: `/home/giang/Work/AgentStack/ClaudeHome/ClaudeHome`
 
 Container:
 
 - App code: `/app/src`
-- Workspace root: `/workspace/LangGraph_Manager`
+- Workspace root: `/workspace/LangGraph_Manager/LangGraph_Manager`
 - State: `/data/state`
 
 ## Common Failure Modes
@@ -48,6 +48,6 @@ Container:
 - Static changes usually update via bind mount, but browser may need cache-bust
   or Ctrl+F5.
 - `cwd=/workspace/app` is wrong for this app; normalize/use
-  `/workspace/LangGraph_Manager`.
-- Claude `bypassPermissions` cannot run as root, so executor uses `--user node`.
+  `/workspace/LangGraph_Manager/LangGraph_Manager`.
+- Claude executor runs as the image `node` user with `/home/node/.claude`; keep the mounted workspace and ClaudeHome owned by `uid=1000` (`giang` on this host) so `bypassPermissions` still works.
 - `.claude.json` must be readable by the executor user.

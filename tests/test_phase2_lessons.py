@@ -7,6 +7,7 @@ from langgraph_manager import db
 
 def test_failed_action_creates_lesson_and_blocks_repeat(tmp_path, monkeypatch):
     monkeypatch.setenv("LANGGRAPH_STATE_DIR", str(tmp_path))
+    db.init_db()
 
     calls = {"count": 0}
 
@@ -16,37 +17,38 @@ def test_failed_action_creates_lesson_and_blocks_repeat(tmp_path, monkeypatch):
 
     monkeypatch.setattr(app_module, "cliproxy_chat", lambda messages, system_prompt="": {"ok": True, "data": {"content": '{"mode":"answer","content":"ok"}'}})
     monkeypatch.setattr(app_module, "run_tool", fake_run_tool)
+    monkeypatch.setattr(app_module, "agent_follow_up_after_action", lambda *args, **kwargs: None)
 
-    with TestClient(app) as client:
-        job = client.post("/api/chats", json={"permission_mode": "auto_review"}).json()["job"]
-        for _ in range(2):
-            action = db.add_pending_action(
-                job["id"],
-                "workspace_command",
-                "Run bad cmd",
-                "run",
-                {"command": "badcmd", "cwd": "/workspace"},
-            )
-            client.post(f"/api/actions/{action['id']}/approve")
-
-        action3 = db.add_pending_action(
+    job = db.create_chat_session("lesson_job", permission_mode="full_access")
+    for _ in range(2):
+        action = db.add_pending_action(
             job["id"],
             "workspace_command",
             "Run bad cmd",
             "run",
-            {"command": "badcmd", "cwd": "/workspace"},
+            {"command": "badcmd", "cwd": ""},
         )
-        client.post(f"/api/actions/{action3['id']}/approve")
-        latest = client.get(f"/api/jobs/{job['id']}").json()["job"]
-        action3 = latest["pending_actions"][-1]
-        assert action3["status"] == "failed"
+        app_module.execute_action_and_follow_up(action["id"])
 
-        lessons = client.get("/api/action-lessons").json()["action_lessons"]
-        assert lessons
-        assert lessons[0]["fail_count"] >= 2
-        # third approval should be blocked by lesson and not call run_tool again
-        assert calls["count"] == 2
-        assert "tránh lặp lỗi cũ" in str(action3.get("error") or "")
+    action3 = db.add_pending_action(
+        job["id"],
+        "workspace_command",
+        "Run bad cmd",
+        "run",
+        {"command": "badcmd", "cwd": ""},
+    )
+    app_module.execute_action_and_follow_up(action3["id"])
+    latest = db.get_job(job["id"])
+    assert latest is not None
+    action3 = latest["pending_actions"][-1]
+    assert action3["status"] == "failed"
+
+    lessons = db.list_action_lessons()
+    assert lessons
+    assert lessons[0]["fail_count"] >= 2
+    # third execution should be blocked by lesson and not call run_tool again
+    assert calls["count"] == 2
+    assert "tránh lặp lỗi cũ" in str(action3.get("error") or "")
 
 
 def test_success_resolves_lesson(tmp_path, monkeypatch):

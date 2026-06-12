@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import secrets
+import signal
 import base64
 import binascii
 import io
 import re
 import json
 import os
+import shlex
+import shutil
 import socket
 import subprocess
 import threading
@@ -18,7 +21,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from contextvars import ContextVar
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse, urlunparse, parse_qsl, urlencode
 from urllib.request import Request, urlopen
 import hashlib
 from collections import Counter
@@ -34,7 +37,14 @@ from .hybrid_routing import build_routing_plan
 from .agent_runtime import run_agent_job_state as run_native_job_state
 from .executor import http_json
 from .graph import build_graph
-from .tool_registry import cliproxy_chat, cliproxy_chat_stream, cliproxy_vision, describe_tools, run_tool
+from .tool_registry import (
+    cliproxy_chat,
+    cliproxy_chat_stream,
+    cliproxy_vision,
+    describe_tools,
+    detect_tool_error_class,
+    run_tool,
+)
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -111,7 +121,7 @@ async def request_trace_middleware(request: Request, call_next):
 class CreateJobRequest(BaseModel):
     request: str = Field(min_length=1)
     title: str | None = None
-    permission_mode: str = "auto_review"
+    permission_mode: str = "full_access"
 
 
 class MessageRequest(BaseModel):
@@ -120,7 +130,7 @@ class MessageRequest(BaseModel):
 
 
 class ChatSessionRequest(BaseModel):
-    permission_mode: str = "auto_review"
+    permission_mode: str = "full_access"
 
 
 class PermissionModeRequest(BaseModel):
@@ -266,6 +276,12 @@ class HostBrowserScreenshotRequest(BaseModel):
     full_screen: bool = False
     name: str = ""
     artifact_dir: str = ""
+    port: int = 9222
+
+
+class HostBrowserMouseRequest(BaseModel):
+    x: int
+    y: int
 
 
 class HostBrowserOcrExtractRequest(BaseModel):
@@ -277,7 +293,100 @@ class HostBrowserOcrExtractRequest(BaseModel):
     excerpt: str = ""
 
 
-PERMISSION_MODES = {"default_permissions", "auto_review", "full_access"}
+class HostShellRunRequest(BaseModel):
+    command: str = Field(min_length=1)
+    cwd: str = ""
+    timeout: int = 60
+
+
+class HostFileReadRequest(BaseModel):
+    path: str = Field(min_length=1)
+    max_chars: int = 40000
+
+
+class HostFileListRequest(BaseModel):
+    path: str = Field(min_length=1)
+    limit: int = 200
+
+
+class HostFileWriteRequest(BaseModel):
+    path: str = Field(min_length=1)
+    content: str = ""
+    overwrite: bool = True
+    create_parents: bool = False
+
+
+class HostFileMoveRequest(BaseModel):
+    src_path: str = Field(min_length=1)
+    dest_path: str = Field(min_length=1)
+    overwrite: bool = False
+    create_parents: bool = False
+
+
+class HostFileDeleteRequest(BaseModel):
+    path: str = Field(min_length=1)
+    recursive: bool = False
+
+
+class HostDockerPsRequest(BaseModel):
+    all_containers: bool = False
+    limit: int = 50
+    timeout: int = 20
+
+
+class HostServiceStatusRequest(BaseModel):
+    service: str = Field(min_length=1)
+    lines: int = 40
+    timeout: int = 20
+
+
+class HostServiceLogsRequest(BaseModel):
+    service: str = Field(min_length=1)
+    lines: int = 80
+    since: str = ""
+    timeout: int = 20
+
+
+class HostDockerRestartRequest(BaseModel):
+    container: str = Field(min_length=1)
+    timeout: int = 30
+
+
+class HostServiceRestartRequest(BaseModel):
+    service: str = Field(min_length=1)
+    timeout: int = 30
+
+
+class HostContainerRecoveryRequest(BaseModel):
+    container: str = Field(min_length=1)
+    logs_lines: int = 80
+    timeout: int = 45
+
+
+class HostServiceRecoveryRequest(BaseModel):
+    service: str = Field(min_length=1)
+    status_lines: int = 30
+    logs_lines: int = 80
+    timeout: int = 45
+
+
+class HostProcessListRequest(BaseModel):
+    limit: int = 200
+    query: str = ""
+
+
+class HostProcessSignalRequest(BaseModel):
+    pid: int
+    signal_name: str = "TERM"
+
+
+class HostProcessRecoveryRequest(BaseModel):
+    pid: int
+    signal_name: str = "TERM"
+    query: str = ""
+
+
+PERMISSION_MODES = {"full_access"}
 MAX_FOCUS_FILE_CHARS = 80_000
 MAX_ATTACHMENT_BYTES = int(os.getenv("LANGGRAPH_MAX_ATTACHMENT_BYTES", str(8 * 1024 * 1024)))
 MAX_ATTACHMENT_TEXT_CHARS = int(os.getenv("LANGGRAPH_MAX_ATTACHMENT_TEXT_CHARS", "80000"))
@@ -294,6 +403,12 @@ AUX_CONTEXT_TOKEN_BUDGET = int(os.getenv("AUX_CONTEXT_TOKEN_BUDGET", "240"))
 MAX_ACTION_RECOVERY_DEPTH = 3
 MODEL_HISTORY_MESSAGES = int(os.getenv("MODEL_HISTORY_MESSAGES", "8"))
 ACTION_RESULT_ARTIFACT_THRESHOLD = int(os.getenv("ACTION_RESULT_ARTIFACT_THRESHOLD", "3000"))
+MAX_AUTO_CONTINUATIONS = int(os.getenv("LANGGRAPH_MAX_AUTO_CONTINUATIONS", "4"))
+HOST_ALLOWED_ROOTS = [
+    Path("/home/giang").resolve(),
+    Path(os.getenv("LANGGRAPH_STATE_DIR", str(STATE_DIR))).resolve(),
+    Path("/tmp").resolve(),
+]
 SUPPORTED_ACTION_KINDS = {
     "workspace_inspect",
     "workspace_read_file",
@@ -311,6 +426,24 @@ SUPPORTED_ACTION_KINDS = {
     "host_browser_launch",
     "host_browser_facebook_research",
     "host_browser_screenshot",
+    "host_browser_mouse_click",
+    "host_browser_mouse_move",
+    "host_shell_command",
+    "host_process_list",
+    "host_file_read",
+    "host_file_list",
+    "host_file_write",
+    "host_file_move",
+    "host_file_delete",
+    "host_docker_ps",
+    "host_service_status",
+    "host_service_logs",
+    "host_docker_restart",
+    "host_service_restart",
+    "host_container_recovery",
+    "host_service_recovery",
+    "host_process_signal",
+    "host_process_recovery",
 }
 ASSISTANT_MESSAGE_ROLES = {"manager", "langgraph", "claude"}
 HYBRID_ROUTING_ENABLED = os.getenv("HYBRID_ROUTING_ENABLED", "1").lower() in {"1", "true", "yes"}
@@ -327,9 +460,8 @@ ROUTING_TRACE_ENABLED = os.getenv("ROUTING_TRACE_ENABLED", "1").lower() in {"1",
 
 
 def validate_permission_mode(value: str) -> str:
-    if value not in PERMISSION_MODES:
-        raise HTTPException(status_code=422, detail="invalid permission_mode")
-    return value
+    _ = value
+    return "full_access"
 
 
 def validate_coding_executor(value: str) -> str:
@@ -394,16 +526,27 @@ def direct_host_browser_decision(content: str) -> dict | None:
     if not normalized:
         return None
 
-    mentions_facebook = any(marker in normalized for marker in ["facebook", "fb", "face"])
+    mentions_facebook = any(
+        re.search(pattern, normalized)
+        for pattern in [r"\bfacebook\b", r"\bfb\b", r"\bface\b", r"\bfacbook\b"]
+    )
     research_markers = [
         "tìm", "tim", "search", "research", "kiếm", "kiem",
         "bài viết", "bai viet", "bài", "post", "posts",
         "tuyển", "tuyen", "hiring", "viec lam", "việc làm",
     ]
+    debug_markers = [
+        "sửa", "sua", "fix", "lỗi", "loi", "bug", "debug", "kiểm tra", "kiem tra",
+        "không research được", "khong research duoc", "http 500", "fetch failed",
+        "route", "routing", "trigger", "từ khóa", "tu khoa", "ngữ cảnh", "ngu canh",
+    ]
     open_markers = [
         "mở facebook", "mo facebook", "vào facebook", "vao facebook", "lên facebook", "len facebook",
         "mở face", "mo face", "vào face", "vao face", "lên face", "len face", "trên face", "tren face",
     ]
+
+    if mentions_facebook and any(marker in normalized for marker in debug_markers):
+        return None
 
     if mentions_facebook and any(marker in normalized for marker in open_markers) and not any(marker in normalized for marker in research_markers):
         return {
@@ -527,7 +670,8 @@ ASSISTANT_AGENT_SYSTEM_PROMPT = (
     "Chỉ hỏi/đòi xác nhận khi hành động có rủi ro rõ: đăng nhập Gmail/tài khoản, nhập mật khẩu/OTP/token/API key, gửi email/form chứa dữ liệu cá nhân, thanh toán, mua hàng, upload dữ liệu nhạy cảm, xóa/sửa dữ liệu, đổi cài đặt bảo mật, hoặc cấp quyền hệ thống. "
     "Không được tự nhận đã thực thi khi backend chưa trả kết quả action. "
     "Vai trò chính của bạn là router nhẹ: trả lời câu thường, còn việc nặng phải giao Claude executor. "
-    "Nếu người dùng muốn mở browser thật trên máy, research web/Facebook bằng session local, hoặc chụp màn hình host, ưu tiên action host_browser_open_current|host_browser_open|host_browser_launch|host_browser_list|host_browser_facebook_research|host_browser_screenshot thay vì giả lập bằng text. "
+    "Nếu người dùng muốn mở browser thật trên máy, research web/Facebook bằng session local, chụp màn hình host, hoặc điều khiển chuột host, ưu tiên action host_browser_open_current|host_browser_open|host_browser_launch|host_browser_list|host_browser_facebook_research|host_browser_screenshot|host_browser_mouse_click|host_browser_mouse_move thay vì giả lập bằng text. "
+    "Nếu câu có Facebook/face nhưng đang báo lỗi, debug, sửa route/trigger/từ khóa/ngữ cảnh, hoặc nhắc lỗi host_browser_facebook_research, không tạo host_browser_facebook_research; phải giao coding_agent_executor. "
     "Nếu yêu cầu có dấu hiệu cần sửa/debug/review/refactor code, sửa UI/frontend, đọc/phân tích repo/source/file/PDF, tìm hàm/class/route/component, tra docs/version thư viện, hoặc cần plugin/MCP như Serena/Context7, luôn trả về pending_action kind coding_agent_executor. "
     "Không dùng answer cho các việc workspace/code nặng; chỉ dùng answer cho câu hỏi khái niệm hoặc trao đổi không cần đọc/sửa file. "
     "Nếu chỉ cần trả lời/thảo luận, dùng "
@@ -537,11 +681,11 @@ ASSISTANT_AGENT_SYSTEM_PROMPT = (
     "Nếu cần đọc workspace/repo, dùng workspace_inspect trước, workspace_read_file để đọc file cụ thể, workspace_diff để xem thay đổi; không tự sửa file bằng patch. "
     "Nếu cần code/sửa repo/UI/debug/review/refactor/docs/version/file analysis, tạo action coding_agent_executor để giao việc cho Claude executor; chỉ dùng workspace_command cho lệnh đọc/kiểm tra nhẹ không cần suy luận. "
     "Nếu cần chạy lệnh trên workspace hoặc lưu memory/skill, dùng "
-    '{"mode":"pending_action","reply":"...","action":{"kind":"workspace_inspect|workspace_read_file|workspace_diff|workspace_command|coding_agent_executor|create_memory|create_skill|host_browser_open_current|host_browser_open|host_browser_launch|host_browser_list|host_browser_facebook_research|host_browser_screenshot|note","title":"...","preview":"...","payload":{...}}}. '
+    '{"mode":"pending_action","reply":"...","action":{"kind":"workspace_inspect|workspace_read_file|workspace_diff|workspace_command|coding_agent_executor|create_memory|create_skill|host_browser_open_current|host_browser_open|host_browser_launch|host_browser_list|host_browser_facebook_research|host_browser_screenshot|host_browser_mouse_click|host_browser_mouse_move|note","title":"...","preview":"...","payload":{...}}}. '
     "workspace_inspect payload có thể có max_files. workspace_read_file payload cần path và có thể có max_chars. workspace_diff payload có thể có path. "
     "workspace_command payload nên có command, cwd, risk low|medium|high, timeout. "
     "coding_agent_executor payload có thể có cwd, timeout, request override; Claude executor sẽ nhận prompt qua stdin. "
-    "host_browser_open_current payload nên có url và có thể có browser; nếu browser đang mở thì focus cửa sổ hiện có và mở tab mới, nếu chưa có thì tự mở browser. host_browser_open payload nên có url và có thể có browser. host_browser_launch payload có thể có url, browser, port, profile_dir để mở browser visible với remote debugging riêng. host_browser_list không cần payload. host_browser_facebook_research payload nên có query và có thể có browser, port, limit, scroll_rounds, profile_dir; nó dùng browser debug visible với profile persistent để đọc search results/bài viết. host_browser_screenshot payload có thể có pid, full_screen, name. "
+    "host_browser_open_current payload nên có url và có thể có browser; nếu browser đang mở thì focus cửa sổ hiện có và mở tab mới, nếu chưa có thì tự mở browser. host_browser_open payload nên có url và có thể có browser. host_browser_launch payload có thể có url, browser, port, profile_dir để mở browser visible với remote debugging riêng. host_browser_list không cần payload. host_browser_facebook_research payload nên có query và có thể có browser, port, limit, scroll_rounds, profile_dir; nó dùng browser debug visible với profile persistent để đọc search results/bài viết. host_browser_screenshot payload có thể có pid, full_screen, name. host_browser_mouse_click|host_browser_mouse_move payload nên có x,y theo toạ độ màn hình host. "
     "create_memory payload nên có kind, title, content, tags. create_skill payload nên có name, description, triggers, source, body. "
     "create_recurring_task payload nên có name, prompt, schedule, action_kind, payload, next_run_at. "
     "Sau khi một action chạy xong, hãy đọc kết quả: nếu hoàn tất thì answer; nếu cần bước tiếp thì tạo pending_action mới; nếu cần nhớ bài học thì tạo create_memory/create_skill. "
@@ -586,12 +730,227 @@ def template_payload(value: Any, command_input: str, job: dict | None = None) ->
 
 def slash_command_help() -> str:
     commands = db.list_commands(include_inactive=False)
+    lines = [
+        "Host commands có sẵn:",
+        "/host help - xem các host subcommand",
+        "/host ps [query] - liệt kê process trên máy",
+        "/host docker [all] - liệt kê container Docker",
+        "/host status <service> - xem service status",
+        "/host logs <service> - xem service logs",
+        "/host open <url> - mở URL bằng browser host",
+        "/host facebook-search <query> - research Facebook bằng session local",
+        "/host shot - chụp màn hình host",
+        "/host shell <command> - chạy shell trên máy host",
+        "/host ls <path> - liệt kê thư mục host",
+        "/host read <path> - đọc file host",
+    ]
     if not commands:
-        return "Chưa có command nào. Vào Settings > Commands để tạo /command dùng mãi."
-    lines = ["Commands đang có:"]
+        lines.append("Chưa có command tùy biến nào. Vào Settings > Commands để tạo thêm /command dùng mãi.")
+        return "\n".join(lines)
+    lines.append("")
+    lines.append("Commands tùy biến đang có:")
     for item in commands:
         lines.append(f"/{item['name']} - {item.get('description') or item.get('action_kind')}")
     return "\n".join(lines)
+
+
+def _host_slash_decision(command_input: str) -> dict[str, Any] | None:
+    raw = str(command_input or "").strip()
+    if not raw:
+        return {
+            "reply": slash_command_help(),
+            "action": {
+                "kind": "note",
+                "title": "/host help",
+                "preview": "Hiển thị host subcommands",
+                "payload": {"kind": "note", "title": "Host command help", "content": slash_command_help()},
+            },
+        }
+    parts = raw.split(None, 1)
+    subcommand = parts[0].strip().lower()
+    rest = parts[1].strip() if len(parts) > 1 else ""
+    if subcommand in {"help", "commands"}:
+        return {
+            "reply": slash_command_help(),
+            "action": {
+                "kind": "note",
+                "title": "/host help",
+                "preview": "Hiển thị host subcommands",
+                "payload": {"kind": "note", "title": "Host command help", "content": slash_command_help()},
+            },
+        }
+    if subcommand == "ps":
+        return {
+            "reply": "Mình đã mở action đọc process trên máy host.",
+            "action": {
+                "kind": "host_process_list",
+                "title": "/host ps",
+                "preview": rest or "Liệt kê process trên máy host",
+                "payload": {"limit": 50, "query": rest},
+            },
+        }
+    if subcommand == "docker":
+        return {
+            "reply": "Mình đã mở action đọc Docker trên host.",
+            "action": {
+                "kind": "host_docker_ps",
+                "title": "/host docker",
+                "preview": rest or "Liệt kê Docker containers",
+                "payload": {"all_containers": "all" in rest.lower().split(), "limit": 50, "timeout": 20},
+            },
+        }
+    if subcommand == "status":
+        if not rest:
+            return {
+                "reply": "Thiếu tên service. Dùng `/host status nginx`.",
+                "action": {"kind": "note", "title": "/host status", "preview": "Thiếu service", "payload": {"kind": "note", "title": "Thiếu service", "content": "Ví dụ: /host status nginx"}},
+            }
+        return {
+            "reply": "Mình đã mở action xem service status trên host.",
+            "action": {
+                "kind": "host_service_status",
+                "title": "/host status",
+                "preview": rest,
+                "payload": {"service": rest, "lines": 40, "timeout": 20},
+            },
+        }
+    if subcommand == "logs":
+        if not rest:
+            return {
+                "reply": "Thiếu tên service. Dùng `/host logs nginx`.",
+                "action": {"kind": "note", "title": "/host logs", "preview": "Thiếu service", "payload": {"kind": "note", "title": "Thiếu service", "content": "Ví dụ: /host logs nginx"}},
+            }
+        return {
+            "reply": "Mình đã mở action xem service logs trên host.",
+            "action": {
+                "kind": "host_service_logs",
+                "title": "/host logs",
+                "preview": rest,
+                "payload": {"service": rest, "lines": 80, "since": "", "timeout": 20},
+            },
+        }
+    if subcommand == "open":
+        if not rest:
+            return {
+                "reply": "Thiếu URL. Dùng `/host open https://example.com`.",
+                "action": {"kind": "note", "title": "/host open", "preview": "Thiếu URL", "payload": {"kind": "note", "title": "Thiếu URL", "content": "Ví dụ: /host open https://example.com"}},
+            }
+        return {
+            "reply": "Mình đã mở action browser host.",
+            "action": {
+                "kind": "host_browser_open_current",
+                "title": "/host open",
+                "preview": rest,
+                "payload": {"url": rest, "browser": "brave"},
+            },
+        }
+    if subcommand in {"facebook-search", "facebook", "fb"}:
+        if not rest:
+            return {
+                "reply": "Thiếu query. Dùng `/host facebook-search devops intern hcm`.",
+                "action": {"kind": "note", "title": "/host facebook-search", "preview": "Thiếu query", "payload": {"kind": "note", "title": "Thiếu query", "content": "Ví dụ: /host facebook-search devops intern hcm"}},
+            }
+        return {
+            "reply": "Mình đã mở action Facebook research trên host.",
+            "action": {
+                "kind": "host_browser_facebook_research",
+                "title": "/host facebook-search",
+                "preview": rest,
+                "payload": {"query": rest, "browser": "brave", "port": 9222, "limit": 8, "scroll_rounds": 4},
+            },
+        }
+    if subcommand in {"shot", "screenshot"}:
+        return {
+            "reply": "Mình đã mở action chụp màn hình host.",
+            "action": {
+                "kind": "host_browser_screenshot",
+                "title": "/host shot",
+                "preview": "Chụp màn hình host",
+                "payload": {"name": "host_capture_{{job_id}}.png", "full_screen": False},
+            },
+        }
+    if subcommand == "move":
+        parts = rest.split()
+        if len(parts) < 2:
+            return {
+                "reply": "Thiếu toạ độ. Dùng `/host move 800 450`.",
+                "action": {"kind": "note", "title": "/host move", "preview": "Thiếu toạ độ", "payload": {"kind": "note", "title": "Thiếu toạ độ", "content": "Ví dụ: /host move 800 450"}},
+            }
+        return {
+            "reply": "Mình đã mở action di chuyển chuột host.",
+            "action": {
+                "kind": "host_browser_mouse_move",
+                "title": "/host move",
+                "preview": rest,
+                "payload": {"x": int(parts[0]), "y": int(parts[1])},
+            },
+        }
+    if subcommand == "click":
+        parts = rest.split()
+        if len(parts) < 2:
+            return {
+                "reply": "Thiếu toạ độ. Dùng `/host click 800 450`.",
+                "action": {"kind": "note", "title": "/host click", "preview": "Thiếu toạ độ", "payload": {"kind": "note", "title": "Thiếu toạ độ", "content": "Ví dụ: /host click 800 450"}},
+            }
+        return {
+            "reply": "Mình đã mở action click chuột host.",
+            "action": {
+                "kind": "host_browser_mouse_click",
+                "title": "/host click",
+                "preview": rest,
+                "payload": {"x": int(parts[0]), "y": int(parts[1])},
+            },
+        }
+    if subcommand == "shell":
+        if not rest:
+            return {
+                "reply": "Thiếu command. Dùng `/host shell pwd`.",
+                "action": {"kind": "note", "title": "/host shell", "preview": "Thiếu command", "payload": {"kind": "note", "title": "Thiếu command", "content": "Ví dụ: /host shell pwd"}},
+            }
+        return {
+            "reply": "Mình đã mở action shell trên host.",
+            "action": {
+                "kind": "host_shell_command",
+                "title": "/host shell",
+                "preview": rest,
+                "payload": {"command": rest, "cwd": "", "timeout": 60},
+            },
+        }
+    if subcommand == "ls":
+        target = rest or "/home/giang"
+        return {
+            "reply": "Mình đã mở action liệt kê file trên host.",
+            "action": {
+                "kind": "host_file_list",
+                "title": "/host ls",
+                "preview": target,
+                "payload": {"path": target, "limit": 200},
+            },
+        }
+    if subcommand == "read":
+        if not rest:
+            return {
+                "reply": "Thiếu path. Dùng `/host read /home/giang/file.txt`.",
+                "action": {"kind": "note", "title": "/host read", "preview": "Thiếu path", "payload": {"kind": "note", "title": "Thiếu path", "content": "Ví dụ: /host read /home/giang/file.txt"}},
+            }
+        return {
+            "reply": "Mình đã mở action đọc file trên host.",
+            "action": {
+                "kind": "host_file_read",
+                "title": "/host read",
+                "preview": rest,
+                "payload": {"path": rest, "max_chars": 40000},
+            },
+        }
+    return {
+        "reply": f"Không hỗ trợ `/host {subcommand}`. Dùng `/host help` để xem danh sách.",
+        "action": {
+            "kind": "note",
+            "title": "/host help",
+            "preview": f"Unknown subcommand: {subcommand}",
+            "payload": {"kind": "note", "title": "Unknown host subcommand", "content": slash_command_help()},
+        },
+    }
 
 
 def handle_slash_command(job_id: str, content: str, job: dict) -> bool:
@@ -600,6 +959,19 @@ def handle_slash_command(job_id: str, content: str, job: dict) -> bool:
         return False
     name = match.group(1).lower()
     command_input = (match.group(2) or "").strip()
+    if name == "host":
+        decision = _host_slash_decision(command_input)
+        if decision:
+            action = decision.get("action") if isinstance(decision.get("action"), dict) else {}
+            if str(action.get("kind") or "") == "note":
+                reply = str(decision.get("reply") or action.get("payload", {}).get("content") or "").strip()
+                if reply:
+                    db.add_message(job_id, "langgraph", reply)
+                    refresh_session_memory(job_id)
+                    return True
+            save_pending_action_from_decision(job_id, {"mode": "pending_action", **decision}, auto_execute_safe=True)
+            refresh_session_memory(job_id)
+            return True
     if name in {"commands", "help"}:
         db.add_message(job_id, "langgraph", slash_command_help())
         refresh_session_memory(job_id)
@@ -979,7 +1351,7 @@ def action_requires_publish_approval(action: dict) -> bool:
     return any(marker in haystack for marker in PUBLISH_APPROVAL_MARKERS)
 
 
-def is_safe_auto_action(action: dict, permission_mode: str = "auto_review") -> bool:
+def is_safe_auto_action(action: dict, permission_mode: str = "full_access") -> bool:
     kind = str(action.get("kind") or "")
     payload = action.get("payload") if isinstance(action.get("payload"), dict) else {}
     if kind != "workspace_inspect":
@@ -988,10 +1360,13 @@ def is_safe_auto_action(action: dict, permission_mode: str = "auto_review") -> b
     return not any(marker in blob for marker in SENSITIVE_BROWSER_MARKERS)
 
 
-def should_auto_execute_action(action: dict, permission_mode: str = "auto_review") -> bool:
+def should_auto_execute_action(action: dict, permission_mode: str = "full_access") -> bool:
     # Even in full_access, public/social publish/send style actions must be
     # explicitly approved by user to avoid accidental external side effects.
     if action_requires_publish_approval(action):
+        return False
+    policy = classify_action_policy(action)
+    if bool(policy.get("requires_approval")):
         return False
     if permission_mode == "full_access":
         return str(action.get("kind") or "") in SUPPORTED_ACTION_KINDS
@@ -1083,8 +1458,14 @@ def execute_action_and_follow_up(action_id: int) -> None:
             )
             # Keep the UI in Working while the agent reads the failure and decides
             # whether a recovery action is possible.
+            error_class = detect_error_class(str(output or ""))
             agent_follow_up_after_action(action["job_id"], action, ok, output)
-            db.update_pending_action_status(action_id, status, "", stored_output)
+            db.update_pending_action_status(
+                action_id,
+                status,
+                "",
+                build_action_failure_payload(str(output or ""), error_class, action_id, kind=str(action.get("kind") or "")),
+            )
             db.update_step(action["job_id"], "act", "failed", f"Action #{action_id} failed")
             trace_event(
                 "action_finish",
@@ -1093,10 +1474,18 @@ def execute_action_and_follow_up(action_id: int) -> None:
                 ok=False,
                 status=status,
                 error=compact_text(str(output), 600),
+                error_class=error_class,
             )
     except Exception as exc:
         error_text = compact_text(f"{type(exc).__name__}: {exc}", 1000)
-        db.update_pending_action_status(action_id, "failed", "", error_text)
+        error_class = detect_error_class(error_text)
+        db.update_pending_action_status(
+            action_id,
+            "failed",
+            "",
+            build_action_failure_payload(error_text, error_class, action_id, kind=str(action.get("kind") or "")),
+        )
+        db.update_step(action["job_id"], "verify", "failed", "Action pipeline crashed before verification completed")
         db.update_step(action["job_id"], "act", "failed", f"Action #{action_id} failed with exception")
         db.upsert_action_lesson_failure(
             signature,
@@ -1111,9 +1500,18 @@ def execute_action_and_follow_up(action_id: int) -> None:
             ok=False,
             status="failed",
             error=error_text,
+            error_class=error_class,
         )
     finally:
-        refresh_session_memory(action["job_id"])
+        try:
+            refresh_session_memory(action["job_id"])
+        except Exception as exc:
+            trace_event(
+                "session_memory_refresh_failed",
+                action_id=action_id,
+                job_id=action.get("job_id"),
+                error=compact_text(f"{type(exc).__name__}: {exc}", 400),
+            )
 
 
 def start_action_background(action_id: int) -> None:
@@ -1127,17 +1525,28 @@ def start_action_background(action_id: int) -> None:
 
 
 def save_pending_action_from_decision(job_id: str, decision: dict, auto_execute_safe: bool = False) -> dict:
-    action = decision["action"]
+    action = dict(decision["action"])
+    payload = action.get("payload") if isinstance(action.get("payload"), dict) else {}
+    payload = dict(payload)
+    if action_recovery_depth({"payload": payload}) > 0:
+        payload["continuation_mode"] = "recovery"
+    elif auto_execute_safe:
+        payload.setdefault("continuation_mode", "auto")
+    action["payload"] = payload
     saved = db.add_pending_action(job_id, action["kind"], action["title"], action["preview"], action["payload"])
     db.update_step(job_id, "act", "pending", f"Queued action #{saved['id']} ({action['kind']})")
     job = db.get_job(job_id)
-    permission_mode = str((job or {}).get("permission_mode") or "auto_review")
-    if auto_execute_safe and should_auto_execute_action(action, permission_mode):
+    permission_mode = str((job or {}).get("permission_mode") or "full_access")
+    loop_metrics = build_loop_metrics(job or {}, list((job or {}).get("pending_actions", [])))
+    auto_budget_available = int(loop_metrics.get("remaining_auto_continuations") or 0) > 0
+    if auto_execute_safe and should_auto_execute_action(action, permission_mode) and auto_budget_available:
         if job:
             db.update_pending_action_status(saved["id"], "running")
             start_action_background(saved["id"])
             return db.get_pending_action(saved["id"]) or saved
     approval_note = ""
+    if auto_execute_safe and should_auto_execute_action(action, permission_mode) and not auto_budget_available:
+        approval_note += "\n\nAuto-continuation budget đã chạm ngưỡng nên mình giữ action này ở trạng thái chờ thay vì tự chạy tiếp."
     if action_requires_publish_approval(action):
         approval_note = "\n\nAction này có dấu hiệu publish/send ra bên ngoài nên luôn cần bạn Approve thủ công trước khi chạy."
     reply = (
@@ -1287,7 +1696,7 @@ def format_facebook_research_message(output: str) -> str:
             time_note = "đã xác nhận quá cũ"
         else:
             time_note = clean_facebook_result_text(str(item.get("time_hint") or ""), 60)
-        reason = clean_facebook_result_text(str(item.get("keep_reason") or item.get("llm_reason") or ""), 180)
+        reason = clean_facebook_result_text(str(item.get("llm_reason") or item.get("keep_reason") or ""), 180)
         line = f"{index}. {title}"
         if main_text:
             line += f"\n   - Nội dung chính: {main_text}"
@@ -1518,13 +1927,7 @@ def detect_error_class(text: str) -> str:
     raw = str(text or "").lower()
     if "python" in raw and ("not found" in raw or "no such file" in raw):
         return "python_not_found"
-    if "permission denied" in raw:
-        return "permission_denied"
-    if "timed out" in raw or "timeout" in raw:
-        return "timeout"
-    if "command not found" in raw:
-        return "command_not_found"
-    return "runtime_error"
+    return detect_tool_error_class(raw)
 
 
 def task_signature_for_request(request: str) -> str:
@@ -1597,16 +2000,14 @@ def build_route_memory_hint(job: dict, request: str) -> str:
     return "\n".join(lines)[:1200]
 
 
-def maybe_store_action_artifact(action_id: int, output: str, is_error: bool = False, kind: str = "") -> str:
+def _maybe_store_large_text_artifact(prefix: str, output: str, is_error: bool = False) -> str:
     text = str(output or "")
-    if str(kind or "") == "host_browser_facebook_research":
-        return text
     if len(text) <= ACTION_RESULT_ARTIFACT_THRESHOLD:
         return text
     artifact_dir = Path(os.getenv("LANGGRAPH_STATE_DIR", str(STATE_DIR))).resolve() / "action_artifacts"
     artifact_dir.mkdir(parents=True, exist_ok=True)
     suffix = "error" if is_error else "result"
-    path = artifact_dir / f"action_{action_id}_{suffix}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}.json"
+    path = artifact_dir / f"{prefix}_{suffix}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}.json"
     path.write_text(text, encoding="utf-8")
     summary = compact_action_output_for_model(text, 1200)
     artifact_url = f"/artifacts/action_artifacts/{path.name}"
@@ -1624,38 +2025,553 @@ def maybe_store_action_artifact(action_id: int, output: str, is_error: bool = Fa
     )
 
 
+def maybe_store_action_artifact(action_id: int, output: str, is_error: bool = False, kind: str = "") -> str:
+    text = str(output or "")
+    if str(kind or "") == "host_browser_facebook_research":
+        return text
+    return _maybe_store_large_text_artifact(f"action_{action_id}", text, is_error=is_error)
+
+
+def maybe_store_job_result_artifact(job_id: str, output: str, is_error: bool = False) -> str:
+    return _maybe_store_large_text_artifact(f"job_{job_id}", output, is_error=is_error)
+
+
+def build_action_failure_payload(output: str, error_class: str, action_id: int, kind: str = "") -> str:
+    stored = maybe_store_action_artifact(action_id, output, is_error=True, kind=kind)
+    parsed: dict[str, Any] = {}
+    try:
+        candidate = json.loads(str(stored or ""))
+        if isinstance(candidate, dict):
+            parsed = candidate
+    except Exception:
+        parsed = {}
+    return json.dumps(
+        {
+            "summary": compact_action_output_for_model(str(output or ""), 800),
+            "error_class": str(error_class or detect_error_class(str(output or "")) or "runtime_error"),
+            "artifact": bool(parsed.get("artifact")),
+            "artifact_path": str(parsed.get("artifact_path") or ""),
+            "artifact_url": str(parsed.get("artifact_url") or ""),
+            "bytes": int(parsed.get("bytes") or len(str(output or "").encode("utf-8"))),
+            "truncated": bool(parsed.get("truncated")),
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+
+
+def _hydrate_artifact_backed_text(raw_value: str) -> str:
+    raw = str(raw_value or "").strip()
+    if not raw:
+        return raw
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return raw
+    if not (isinstance(parsed, dict) and parsed.get("artifact") and parsed.get("artifact_path")):
+        return raw
+    artifact_path = Path(str(parsed.get("artifact_path") or "")).expanduser()
+    if not artifact_path.exists():
+        return raw
+    try:
+        return artifact_path.read_text(encoding="utf-8")
+    except Exception:
+        return raw
+
+
 def hydrate_action_result_for_ui(action: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(action, dict):
         return action
-    if str(action.get("kind") or "") != "host_browser_facebook_research":
-        return action
+    hydrated = dict(action)
     raw_result = str(action.get("result") or "").strip()
-    if not raw_result:
-        return action
+    if raw_result:
+        hydrated["result"] = _hydrate_artifact_backed_text(raw_result)
+    raw_error = str(action.get("error") or "").strip()
+    if raw_error:
+        hydrated["error"] = _hydrate_artifact_backed_text(raw_error)
+    hydrated["policy"] = classify_action_policy(hydrated)
+    return hydrated
+
+
+def classify_action_policy(action: dict[str, Any]) -> dict[str, Any]:
+    kind = str(action.get("kind") or "")
+    payload = action.get("payload") if isinstance(action.get("payload"), dict) else {}
+    preview = " ".join(
+        [
+            kind,
+            str(action.get("title") or ""),
+            str(action.get("preview") or ""),
+            json.dumps(payload, ensure_ascii=False),
+        ]
+    ).lower()
+    capability_tags: list[str] = []
+    approval_class = "read_only"
+    reason = "Safe read-oriented action."
+    if kind.startswith("host_browser_"):
+        capability_tags.extend(["host", "browser"])
+        approval_class = "network"
+        reason = "Host/browser action reaches external pages or local browser state."
+    elif kind == "host_shell_command":
+        capability_tags.extend(["host", "shell"])
+        approval_class = "write"
+        reason = "Host shell action executes directly on Linux machine."
+    elif kind == "host_docker_ps":
+        capability_tags.extend(["host", "docker", "read"])
+        approval_class = "read_only"
+        reason = "Host Docker inventory is a read-only Linux operator action."
+    elif kind == "host_process_list":
+        capability_tags.extend(["host", "process", "read"])
+        approval_class = "read_only"
+        reason = "Host process inventory is a read-only machine inspection action."
+    elif kind == "host_process_signal":
+        capability_tags.extend(["host", "process", "write"])
+        approval_class = "operator_write"
+        reason = "Host process signal mutates running Linux processes and requires approval."
+    elif kind == "host_process_recovery":
+        capability_tags.extend(["host", "process", "recovery"])
+        approval_class = "operator_write"
+        reason = "Host process recovery may signal Linux processes and requires approval."
+    elif kind == "host_service_status":
+        capability_tags.extend(["host", "service", "read"])
+        approval_class = "read_only"
+        reason = "Host service status inspects Linux unit health without mutation."
+    elif kind == "host_service_logs":
+        capability_tags.extend(["host", "service", "logs"])
+        approval_class = "read_only"
+        reason = "Host service logs tail inspects recent Linux journal output."
+    elif kind in {"host_docker_restart", "host_service_restart"}:
+        capability_tags.extend(["host", "operator", "write"])
+        if "docker" in kind:
+            capability_tags.append("docker")
+        if "service" in kind:
+            capability_tags.append("service")
+        approval_class = "operator_write"
+        reason = "Host operator write action mutates Linux runtime state and requires approval."
+    elif kind in {"host_container_recovery", "host_service_recovery"}:
+        capability_tags.extend(["host", "operator", "recovery"])
+        if "container" in kind or "docker" in kind:
+            capability_tags.append("docker")
+        if "service" in kind:
+            capability_tags.append("service")
+        approval_class = "operator_write"
+        reason = "Host recovery workflow may restart Linux runtime targets and requires approval."
+    elif kind in {"host_file_read", "host_file_list"}:
+        capability_tags.extend(["host", "file"])
+        approval_class = "read_only"
+        reason = "Host file action reads Linux filesystem state."
+    elif kind in {"host_file_write", "host_file_move", "host_file_delete"}:
+        capability_tags.extend(["host", "file", "write"])
+        approval_class = "operator_write"
+        reason = "Host file mutation changes Linux filesystem state and requires approval."
+    elif kind == "coding_agent_executor":
+        capability_tags.extend(["executor", "code"])
+        approval_class = "write"
+        reason = "Executor may edit code, files, or run multi-step commands."
+    elif kind == "workspace_command":
+        capability_tags.extend(["workspace", "shell"])
+        approval_class = "write"
+        reason = "Shell command may mutate workspace or environment."
+    elif kind in {"workspace_diff", "workspace_read_file", "workspace_inspect"}:
+        capability_tags.extend(["workspace", "read"])
+    elif kind in {"git_checkpoint", "git_restore_checkpoint"}:
+        capability_tags.extend(["git", "checkpoint"])
+        approval_class = "write"
+        reason = "Git checkpoint actions mutate repository state."
+    elif kind == "note":
+        capability_tags.append("note")
+    if kind.startswith("host_browser_") and any(marker in preview for marker in SENSITIVE_BROWSER_MARKERS):
+        approval_class = "credentialed"
+        capability_tags.append("credentialed")
+        reason = "Action touches login, token, password, or other credentialed flow."
+    if action_requires_publish_approval(action):
+        approval_class = "publish"
+        capability_tags.append("publish")
+        reason = "Action may publish, send, or create external side effects."
+    if approval_class in {"network", "credentialed", "publish"} and "network" not in capability_tags:
+        capability_tags.append("network")
+    status = str(action.get("status") or "")
+    requires_approval = status == "pending" and approval_class in {"credentialed", "publish", "network", "operator_write"}
+    return {
+        "approval_class": approval_class,
+        "requires_approval": requires_approval,
+        "capability_tags": capability_tags,
+        "reason": reason,
+    }
+
+
+def build_job_notifications(job: dict[str, Any], verification: dict[str, Any], pending_actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    notifications: list[dict[str, Any]] = []
+    status = str(job.get("status") or "")
+    if verification and not bool(verification.get("ok", True)):
+        missing = verification.get("missing_requirements") if isinstance(verification.get("missing_requirements"), list) else []
+        notifications.append(
+            {
+                "level": "warning",
+                "code": "verification_failed",
+                "message": compact_text(", ".join(str(item) for item in missing[:4]) or "Verification failed. Review evidence before retry.", 220),
+            }
+        )
+    for action in pending_actions[:5]:
+        policy = action.get("policy") if isinstance(action.get("policy"), dict) else classify_action_policy(action)
+        if str(action.get("status") or "") != "pending":
+            continue
+        if policy.get("requires_approval"):
+            notifications.append(
+                {
+                    "level": "info",
+                    "code": "approval_required",
+                    "message": compact_text(f"Approval needed for {action.get('title') or action.get('kind')} ({policy.get('approval_class')}).", 220),
+                }
+            )
+            continue
+        if str(action.get("title") or "").startswith("Recurring:"):
+            notifications.append(
+                {
+                    "level": "info",
+                    "code": "recurring_due",
+                    "message": compact_text(f"Recurring task ready: {action.get('title')}.", 220),
+                }
+            )
+    if status == "done":
+        notifications.append({"level": "success", "code": "job_done", "message": "Job completed with structured evidence."})
+    elif status == "failed" and not notifications:
+        notifications.append({"level": "warning", "code": "job_failed", "message": "Job failed. Review artifacts, logs, and next action hints."})
+    return notifications[:6]
+
+
+def build_job_session_summary(job: dict[str, Any], verification: dict[str, Any], pending_actions: list[dict[str, Any]]) -> str:
+    plan_count = len(job.get("plan") or []) if isinstance(job.get("plan"), list) else 0
+    pending_count = sum(1 for action in pending_actions if str(action.get("status") or "") == "pending")
+    done_count = sum(1 for action in pending_actions if str(action.get("status") or "") == "done")
+    parts = [
+        f"status={str(job.get('status') or 'unknown')}",
+        f"plan_steps={plan_count}",
+        f"pending_actions={pending_count}",
+        f"completed_actions={done_count}",
+    ]
+    if verification:
+        parts.append(f"verification={'ok' if verification.get('ok') else 'failed'}")
+    title = str(job.get("title") or "").strip()
+    if title:
+        parts.insert(0, compact_text(title, 60))
+    return " | ".join(parts)
+
+
+def action_recovery_depth(action: dict[str, Any]) -> int:
+    payload = action.get("payload") if isinstance(action.get("payload"), dict) else {}
     try:
-        parsed = json.loads(raw_result)
-    except Exception:
-        return action
-    if not (isinstance(parsed, dict) and parsed.get("artifact") and parsed.get("artifact_path")):
-        return action
-    artifact_path = Path(str(parsed.get("artifact_path") or "")).expanduser()
-    if not artifact_path.exists():
-        return action
-    try:
-        hydrated = dict(action)
-        hydrated["result"] = artifact_path.read_text(encoding="utf-8")
-        return hydrated
-    except Exception:
-        return action
+        return max(0, int(payload.get("recovery_depth") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def action_continuation_mode(action: dict[str, Any]) -> str:
+    payload = action.get("payload") if isinstance(action.get("payload"), dict) else {}
+    mode = str(payload.get("continuation_mode") or "").strip().lower()
+    if mode:
+        return mode
+    if action_recovery_depth(action) > 0:
+        return "recovery"
+    return ""
+
+
+def build_loop_metrics(job: dict[str, Any], pending_actions: list[dict[str, Any]]) -> dict[str, Any]:
+    permission_mode = str(job.get("permission_mode") or "full_access")
+    auto_candidates = 0
+    auto_pending_candidates = 0
+    used_auto = 0
+    max_recovery = 0
+    for action in pending_actions:
+        policy = action.get("policy") if isinstance(action.get("policy"), dict) else classify_action_policy(action)
+        continuation_mode = action_continuation_mode(action)
+        status = str(action.get("status") or "")
+        max_recovery = max(max_recovery, action_recovery_depth(action))
+        if continuation_mode in {"auto", "recovery"}:
+            used_auto += 1
+        if status != "pending":
+            continue
+        if policy.get("requires_approval"):
+            continue
+        if should_auto_execute_action(action, permission_mode):
+            auto_candidates += 1
+            if continuation_mode in {"auto", "recovery"}:
+                auto_pending_candidates += 1
+    remaining_auto = max(0, MAX_AUTO_CONTINUATIONS - used_auto)
+    return {
+        "max_auto_continuations": MAX_AUTO_CONTINUATIONS,
+        "used_auto_continuations": used_auto,
+        "remaining_auto_continuations": remaining_auto,
+        "max_recovery_depth": max_recovery,
+        "pending_auto_candidates": auto_pending_candidates,
+        "auto_runnable_next_action_count": min(auto_candidates, remaining_auto) if remaining_auto > 0 else 0,
+        "can_auto_continue": auto_candidates > 0 and remaining_auto > 0,
+    }
+
+
+def build_autonomy_status(job: dict[str, Any], pending_actions: list[dict[str, Any]], verification: dict[str, Any]) -> dict[str, Any]:
+    used_actions = len(pending_actions)
+    max_actions = 12 if str(job.get("permission_mode") or "") == "full_access" else 6
+    loop_metrics = build_loop_metrics(job, pending_actions)
+    blocked_actions = [
+        action for action in pending_actions
+        if isinstance(action.get("policy"), dict)
+        and bool(action["policy"].get("requires_approval"))
+        and str(action.get("status") or "") == "pending"
+    ]
+    failed_actions = [action for action in pending_actions if str(action.get("status") or "") == "failed"]
+    stop_reason = ""
+    if blocked_actions:
+        stop_reason = "approval_required"
+    elif used_actions >= max_actions:
+        stop_reason = "action_budget_exhausted"
+    elif verification and not bool(verification.get("ok", True)):
+        stop_reason = "verification_failed"
+    elif len(failed_actions) >= MAX_ACTION_RECOVERY_DEPTH:
+        stop_reason = "recovery_budget_exhausted"
+    elif loop_metrics["remaining_auto_continuations"] <= 0 and loop_metrics["pending_auto_candidates"] > 0:
+        stop_reason = "continuation_budget_exhausted"
+    escalation_level = "none"
+    if stop_reason == "approval_required":
+        escalation_level = "approval"
+    elif stop_reason in {"verification_failed", "recovery_budget_exhausted"}:
+        escalation_level = "review"
+    elif stop_reason in {"action_budget_exhausted", "continuation_budget_exhausted"}:
+        escalation_level = "budget"
+    managed_loop_state = "idle"
+    if stop_reason:
+        managed_loop_state = "blocked"
+    elif any(str(action.get("status") or "") == "running" for action in pending_actions):
+        managed_loop_state = "running"
+    elif loop_metrics["can_auto_continue"]:
+        managed_loop_state = "ready_to_continue"
+    elif any(str(action.get("status") or "") == "pending" for action in pending_actions):
+        managed_loop_state = "waiting"
+    return {
+        "profile": "full_access",
+        "budget": {
+            "max_actions": max_actions,
+            "used_actions": used_actions,
+            "remaining_actions": max(0, max_actions - used_actions),
+        },
+        "blocked": bool(stop_reason),
+        "stop_reason": stop_reason,
+        "approval_required_count": len(blocked_actions),
+        "can_continue_without_user": bool(loop_metrics["can_auto_continue"]) and not bool(stop_reason),
+        "escalation_level": escalation_level,
+        "managed_loop_state": managed_loop_state,
+        "loop": loop_metrics,
+    }
+
+
+def build_attention_score(job: dict[str, Any]) -> tuple[int, list[str]]:
+    reasons: list[str] = []
+    score = 0
+    status = str(job.get("status") or "")
+    autonomy = job.get("autonomy") if isinstance(job.get("autonomy"), dict) else {}
+    notifications = job.get("notifications") if isinstance(job.get("notifications"), list) else []
+    next_actions = job.get("next_actions") if isinstance(job.get("next_actions"), list) else []
+    if any(str(item.get("code") or "") == "verification_failed" for item in notifications if isinstance(item, dict)):
+        score += 50
+        reasons.append("verification_failed")
+    if int(autonomy.get("approval_required_count") or 0) > 0:
+        score += 40
+        reasons.append("approval_required")
+    if any(str(item.get("code") or "") == "recurring_due" for item in notifications if isinstance(item, dict)):
+        score += 25
+        reasons.append("recurring_due")
+    if status == "running":
+        score += 20
+        reasons.append("running")
+    if status == "failed":
+        score += 15
+        reasons.append("failed")
+    if next_actions:
+        score += 10
+        reasons.append("next_action_ready")
+    return score, reasons
+
+
+def _normalized_text_tokens(text: str) -> list[str]:
+    return [token for token in re.findall(r"[a-z0-9_.@/-]+", str(text or "").lower()) if len(token) >= 3]
+
+
+def rank_projects_for_job(
+    job: dict[str, Any],
+    projects: list[dict[str, Any]] | None = None,
+    limit: int = 3,
+) -> list[dict[str, Any]]:
+    active_projects = projects if projects is not None else db.list_projects(include_inactive=False)
+    title = str(job.get("title") or "")
+    request = str(job.get("request") or "")
+    session_summary = str(job.get("session_summary") or "")
+    message_text = ""
+    messages = job.get("messages") if isinstance(job.get("messages"), list) else []
+    if messages:
+        message_text = "\n".join(str(item.get("content") or "") for item in messages[-6:] if isinstance(item, dict))
+    haystack = "\n".join(part for part in [title, request, session_summary, message_text] if part).lower()
+    haystack_tokens = set(_normalized_text_tokens(haystack))
+    ranked: list[dict[str, Any]] = []
+    for project in active_projects:
+        score = 0
+        reasons: list[str] = []
+        name = str(project.get("name") or "").strip()
+        root_path = str(project.get("root_path") or "").strip()
+        summary = str(project.get("summary") or "").strip()
+        memory = str(project.get("memory") or "").strip()
+        if root_path and root_path.lower() in haystack:
+            score += 60
+            reasons.append("root_path_match")
+        name_tokens = set(_normalized_text_tokens(name))
+        name_hits = sorted(name_tokens & haystack_tokens)
+        if name_hits:
+            score += min(36, 18 * len(name_hits))
+            reasons.append(f"name:{','.join(name_hits[:3])}")
+        context_tokens = set(_normalized_text_tokens(f"{summary}\n{memory}"))
+        context_hits = sorted(context_tokens & haystack_tokens)
+        if context_hits:
+            score += min(28, 4 * len(context_hits))
+            reasons.append(f"context:{','.join(context_hits[:4])}")
+        if score <= 0:
+            continue
+        ranked.append(
+            {
+                "id": project.get("id"),
+                "name": name,
+                "root_path": root_path,
+                "status": project.get("status"),
+                "score": score,
+                "reasons": reasons,
+            }
+        )
+    ranked.sort(
+        key=lambda item: (
+            int(item.get("score") or 0),
+            str(item.get("name") or "").lower(),
+        ),
+        reverse=True,
+    )
+    return ranked[: max(1, int(limit))]
+
+
+def build_project_assistant_entry(project: dict[str, Any], jobs: list[dict[str, Any]]) -> dict[str, Any]:
+    related_jobs: list[dict[str, Any]] = []
+    project_id = int(project.get("id") or 0)
+    for job in jobs:
+        primary = job.get("primary_project") if isinstance(job.get("primary_project"), dict) else {}
+        if int(primary.get("id") or 0) != project_id:
+            continue
+        entry = build_inbox_entry(job)
+        related_jobs.append(entry)
+    related_jobs.sort(
+        key=lambda item: (
+            int(item.get("attention_score") or 0),
+            str(item.get("updated_at") or ""),
+        ),
+        reverse=True,
+    )
+    status_counts: dict[str, int] = {}
+    for item in related_jobs:
+        status = str(item.get("status") or "unknown")
+        status_counts[status] = status_counts.get(status, 0) + 1
+    return {
+        "project": project,
+        "open_jobs_count": sum(1 for item in related_jobs if str(item.get("status") or "") not in {"done"}),
+        "urgent_jobs_count": sum(1 for item in related_jobs if int(item.get("attention_score") or 0) >= 40),
+        "top_attention_score": max((int(item.get("attention_score") or 0) for item in related_jobs), default=0),
+        "last_activity_at": max((str(item.get("updated_at") or "") for item in related_jobs), default=""),
+        "status_counts": status_counts,
+        "jobs": related_jobs[:8],
+    }
+
+
+def build_inbox_entry(job: dict[str, Any]) -> dict[str, Any]:
+    hydrated = hydrate_job_for_ui(job)
+    score, reasons = build_attention_score(hydrated)
+    return {
+        "job_id": hydrated.get("id"),
+        "title": hydrated.get("title"),
+        "status": hydrated.get("status"),
+        "updated_at": hydrated.get("updated_at"),
+        "attention_score": score,
+        "attention_reasons": reasons,
+        "session_summary": hydrated.get("session_summary", ""),
+        "notifications": hydrated.get("notifications", []),
+        "next_actions": hydrated.get("next_actions", []),
+        "autonomy": hydrated.get("autonomy", {}),
+        "primary_project": hydrated.get("primary_project"),
+        "related_projects": hydrated.get("related_projects", []),
+    }
+
+
+def build_next_action_entry(action: dict[str, Any], permission_mode: str, autonomy: dict[str, Any]) -> dict[str, Any]:
+    policy = action.get("policy") if isinstance(action.get("policy"), dict) else classify_action_policy(action)
+    loop = autonomy.get("loop") if isinstance(autonomy.get("loop"), dict) else {}
+    auto_capable = bool(should_auto_execute_action(action, permission_mode)) and not bool(policy.get("requires_approval"))
+    budget_blocked = auto_capable and int(loop.get("remaining_auto_continuations") or 0) <= 0
+    blocked_reason = ""
+    if bool(policy.get("requires_approval")):
+        blocked_reason = "approval_required"
+    elif budget_blocked:
+        blocked_reason = "continuation_budget_exhausted"
+    return {
+        "type": "pending_action",
+        "action_id": action.get("id"),
+        "kind": action.get("kind"),
+        "title": action.get("title"),
+        "preview": compact_text(str(action.get("preview") or ""), 240),
+        "policy": policy,
+        "requires_approval": bool(policy.get("requires_approval")),
+        "auto_runnable": auto_capable and not budget_blocked,
+        "blocked_reason": blocked_reason,
+        "continuation_mode": action_continuation_mode(action),
+        "recovery_depth": action_recovery_depth(action),
+    }
 
 
 def hydrate_job_for_ui(job: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(job, dict):
         return job
     hydrated = dict(job)
+    if str(job.get("result") or "").strip():
+        hydrated["result"] = _hydrate_artifact_backed_text(str(job.get("result") or ""))
     pending_actions = job.get("pending_actions") if isinstance(job.get("pending_actions"), list) else []
     hydrated["pending_actions"] = [hydrate_action_result_for_ui(action) for action in pending_actions]
+    verification = job.get("verification") if isinstance(job.get("verification"), dict) else {}
+    hydrated["verification"] = verification
+    permission_mode = str(hydrated.get("permission_mode") or "full_access")
+    autonomy = build_autonomy_status(hydrated, hydrated["pending_actions"], verification)
+    next_actions: list[dict[str, Any]] = []
+    for action in hydrated["pending_actions"][:5]:
+        if str(action.get("status") or "") != "pending":
+            continue
+        next_actions.append(build_next_action_entry(action, permission_mode, autonomy))
+    if not next_actions and str(job.get("status") or "") == "failed" and verification:
+        missing = verification.get("missing_requirements") if isinstance(verification.get("missing_requirements"), list) else []
+        next_actions.append(
+            {
+                "type": "review_verification",
+                "title": "Review failed verification evidence",
+                "preview": compact_text(", ".join(str(item) for item in missing[:6]) or "Inspect verification details and retry safely.", 240),
+            }
+        )
+    hydrated["next_actions"] = next_actions
+    hydrated["notifications"] = build_job_notifications(hydrated, verification, hydrated["pending_actions"])
+    hydrated["session_summary"] = build_job_session_summary(hydrated, verification, hydrated["pending_actions"])
+    hydrated["autonomy"] = autonomy
+    related_projects = rank_projects_for_job(hydrated)
+    hydrated["related_projects"] = related_projects
+    hydrated["primary_project"] = related_projects[0] if related_projects else None
     return hydrated
+
+
+def job_response(job_or_id: dict[str, Any] | str, fallback: dict[str, Any] | None = None) -> dict[str, Any]:
+    job_id = str(job_or_id.get("id") or "") if isinstance(job_or_id, dict) else str(job_or_id or "")
+    job = db.get_job(job_id) if job_id else None
+    if not job and isinstance(job_or_id, dict):
+        job = job_or_id
+    if not job and fallback:
+        job = fallback
+    return {"job": hydrate_job_for_ui(job or {})}
 
 
 def _queue_coding_recovery_action(job_id: str, failed_action: dict) -> bool:
@@ -1798,7 +2714,7 @@ def execute_pending_action(action: dict, job: dict) -> tuple[bool, str]:
             "workspace_inspect",
             {
                 "max_files": int(payload.get("max_files") or 120),
-                "permission_mode": job.get("permission_mode", "auto_review"),
+                "permission_mode": job.get("permission_mode", "full_access"),
             },
         )
         text = json.dumps(result, ensure_ascii=False, indent=2)
@@ -1809,7 +2725,7 @@ def execute_pending_action(action: dict, job: dict) -> tuple[bool, str]:
             {
                 "path": str(payload.get("path") or ""),
                 "max_chars": int(payload.get("max_chars") or 40000),
-                "permission_mode": job.get("permission_mode", "auto_review"),
+                "permission_mode": job.get("permission_mode", "full_access"),
             },
         )
         text = json.dumps(result, ensure_ascii=False, indent=2)
@@ -1820,7 +2736,7 @@ def execute_pending_action(action: dict, job: dict) -> tuple[bool, str]:
             {
                 "path": str(payload.get("path") or ""),
                 "timeout": int(payload.get("timeout") or 20),
-                "permission_mode": job.get("permission_mode", "auto_review"),
+                "permission_mode": job.get("permission_mode", "full_access"),
             },
         )
         text = json.dumps(result, ensure_ascii=False, indent=2)
@@ -1844,7 +2760,7 @@ def execute_pending_action(action: dict, job: dict) -> tuple[bool, str]:
                 "cwd": cwd,
                 "risk": str(payload.get("risk") or "medium"),
                 "timeout": int(payload.get("timeout") or 120),
-                "permission_mode": job.get("permission_mode", "auto_review"),
+                "permission_mode": job.get("permission_mode", "full_access"),
             },
         )
         text = json.dumps(result, ensure_ascii=False, indent=2)
@@ -1895,16 +2811,17 @@ def execute_pending_action(action: dict, job: dict) -> tuple[bool, str]:
         query = str(payload.get("query") or "").strip()
         if not query:
             return False, "host_browser_facebook_research cần payload.query"
-        req = {
-            "query": query,
-            "browser": str(payload.get("browser") or "brave"),
-            "port": int(payload.get("port") or 9222),
-            "limit": int(payload.get("limit") or 8),
-            "scroll_rounds": int(payload.get("scroll_rounds") or 4),
-            "profile_dir": str(payload.get("profile_dir") or ""),
-        }
         try:
-            result = host_browser_call("/facebook-research", req, timeout=240)
+            result = build_host_browser_facebook_research_result(
+                HostBrowserFacebookResearchRequest(
+                    query=query,
+                    browser=str(payload.get("browser") or "brave"),
+                    port=int(payload.get("port") or 9222),
+                    limit=int(payload.get("limit") or 8),
+                    scroll_rounds=int(payload.get("scroll_rounds") or 4),
+                    profile_dir=str(payload.get("profile_dir") or ""),
+                )
+            )
         except Exception as exc:
             return False, f"Không research được Facebook host: {exc}"
         text = json.dumps(result, ensure_ascii=False, indent=2)
@@ -1920,6 +2837,153 @@ def execute_pending_action(action: dict, job: dict) -> tuple[bool, str]:
             result = host_browser_call("/screenshot", req)
         except Exception as exc:
             return False, f"Không chụp được màn hình host: {exc}"
+        text = json.dumps(result, ensure_ascii=False, indent=2)
+        return bool(result.get("ok")), text
+    if kind == "host_browser_mouse_move":
+        req = {
+            "x": int(payload.get("x") or 0),
+            "y": int(payload.get("y") or 0),
+        }
+        try:
+            result = host_browser_call("/mouse-move", req)
+        except Exception as exc:
+            return False, f"Không di chuyển được chuột host: {exc}"
+        text = json.dumps(result, ensure_ascii=False, indent=2)
+        return bool(result.get("ok")), text
+    if kind == "host_browser_mouse_click":
+        req = {
+            "x": int(payload.get("x") or 0),
+            "y": int(payload.get("y") or 0),
+        }
+        try:
+            result = host_browser_call("/mouse-click", req)
+        except Exception as exc:
+            return False, f"Không click được chuột host: {exc}"
+        text = json.dumps(result, ensure_ascii=False, indent=2)
+        return bool(result.get("ok")), text
+    if kind == "host_shell_command":
+        result = run_host_shell_action(
+            str(payload.get("command") or ""),
+            cwd=str(payload.get("cwd") or ""),
+            timeout=int(payload.get("timeout") or 60),
+        )
+        text = json.dumps(result, ensure_ascii=False, indent=2)
+        return bool(result.get("ok")), text
+    if kind == "host_file_read":
+        result = read_host_file(
+            str(payload.get("path") or ""),
+            max_chars=int(payload.get("max_chars") or 40000),
+        )
+        text = json.dumps(result, ensure_ascii=False, indent=2)
+        return bool(result.get("ok")), text
+    if kind == "host_file_list":
+        result = list_host_files(
+            str(payload.get("path") or ""),
+            limit=int(payload.get("limit") or 200),
+        )
+        text = json.dumps(result, ensure_ascii=False, indent=2)
+        return bool(result.get("ok")), text
+    if kind == "host_file_write":
+        result = write_host_file(
+            str(payload.get("path") or ""),
+            content=str(payload.get("content") or ""),
+            overwrite=bool(payload.get("overwrite", True)),
+            create_parents=bool(payload.get("create_parents") or False),
+        )
+        text = json.dumps(result, ensure_ascii=False, indent=2)
+        return bool(result.get("ok")), text
+    if kind == "host_file_move":
+        result = move_host_file(
+            str(payload.get("src_path") or ""),
+            str(payload.get("dest_path") or ""),
+            overwrite=bool(payload.get("overwrite") or False),
+            create_parents=bool(payload.get("create_parents") or False),
+        )
+        text = json.dumps(result, ensure_ascii=False, indent=2)
+        return bool(result.get("ok")), text
+    if kind == "host_file_delete":
+        result = delete_host_path(
+            str(payload.get("path") or ""),
+            recursive=bool(payload.get("recursive") or False),
+        )
+        text = json.dumps(result, ensure_ascii=False, indent=2)
+        return bool(result.get("ok")), text
+    if kind == "host_process_list":
+        result = run_host_process_list(
+            limit=int(payload.get("limit") or 200),
+            query=str(payload.get("query") or ""),
+        )
+        text = json.dumps(result, ensure_ascii=False, indent=2)
+        return bool(result.get("ok")), text
+    if kind == "host_process_signal":
+        result = run_host_process_signal(
+            int(payload.get("pid") or 0),
+            signal_name=str(payload.get("signal_name") or "TERM"),
+        )
+        text = json.dumps(result, ensure_ascii=False, indent=2)
+        return bool(result.get("ok")), text
+    if kind == "host_process_recovery":
+        result = run_host_process_recovery(
+            int(payload.get("pid") or 0),
+            signal_name=str(payload.get("signal_name") or "TERM"),
+            query=str(payload.get("query") or ""),
+        )
+        text = json.dumps(result, ensure_ascii=False, indent=2)
+        return bool(result.get("ok")), text
+    if kind == "host_docker_ps":
+        result = run_host_docker_ps(
+            all_containers=bool(payload.get("all_containers") or False),
+            limit=int(payload.get("limit") or 50),
+            timeout=int(payload.get("timeout") or 20),
+        )
+        text = json.dumps(result, ensure_ascii=False, indent=2)
+        return bool(result.get("ok")), text
+    if kind == "host_service_status":
+        result = run_host_service_status(
+            str(payload.get("service") or ""),
+            lines=int(payload.get("lines") or 40),
+            timeout=int(payload.get("timeout") or 20),
+        )
+        text = json.dumps(result, ensure_ascii=False, indent=2)
+        return bool(result.get("ok")), text
+    if kind == "host_service_logs":
+        result = run_host_service_logs(
+            str(payload.get("service") or ""),
+            lines=int(payload.get("lines") or 80),
+            since=str(payload.get("since") or ""),
+            timeout=int(payload.get("timeout") or 20),
+        )
+        text = json.dumps(result, ensure_ascii=False, indent=2)
+        return bool(result.get("ok")), text
+    if kind == "host_docker_restart":
+        result = run_host_docker_restart(
+            str(payload.get("container") or ""),
+            timeout=int(payload.get("timeout") or 30),
+        )
+        text = json.dumps(result, ensure_ascii=False, indent=2)
+        return bool(result.get("ok")), text
+    if kind == "host_service_restart":
+        result = run_host_service_restart(
+            str(payload.get("service") or ""),
+            timeout=int(payload.get("timeout") or 30),
+        )
+        text = json.dumps(result, ensure_ascii=False, indent=2)
+        return bool(result.get("ok")), text
+    if kind == "host_container_recovery":
+        result = run_host_container_recovery(
+            str(payload.get("container") or ""),
+            logs_lines=int(payload.get("logs_lines") or 80),
+            timeout=int(payload.get("timeout") or 45),
+        )
+        text = json.dumps(result, ensure_ascii=False, indent=2)
+        return bool(result.get("ok")), text
+    if kind == "host_service_recovery":
+        result = run_host_service_recovery(
+            str(payload.get("service") or ""),
+            status_lines=int(payload.get("status_lines") or 30),
+            logs_lines=int(payload.get("logs_lines") or 80),
+            timeout=int(payload.get("timeout") or 45),
+        )
         text = json.dumps(result, ensure_ascii=False, indent=2)
         return bool(result.get("ok")), text
     if kind == "coding_agent_executor":
@@ -1966,7 +3030,7 @@ def execute_pending_action(action: dict, job: dict) -> tuple[bool, str]:
                 "cwd": str(payload.get("cwd") or ""),
                 "risk": str(payload.get("risk") or "medium"),
                 "timeout": int(payload.get("timeout") or 900),
-                "permission_mode": job.get("permission_mode", "auto_review"),
+                "permission_mode": job.get("permission_mode", "full_access"),
             },
         )
         if checkpoint_meta and isinstance(result, dict):
@@ -2134,6 +3198,12 @@ def fallback_planner_questions(discussion: str) -> list[str]:
 def planner_decision(discussion: str, recent_text: str = "") -> dict:
     recent = (recent_text or "").strip()
     onboarding_scope = recent or discussion
+    if looks_like_onboarding_agent_request(onboarding_scope):
+        return {
+            "mode": "plan",
+            "plan": ONBOARDING_AGENT_PLAN,
+            "summary": "deterministic_onboarding_fallback",
+        }
     messages = [{"role": "user", "content": f"Cuộc trò chuyện:\n{discussion}"}]
     started = time.perf_counter()
     result = cliproxy_chat(messages, PLANNER_SYSTEM_PROMPT)
@@ -2151,12 +3221,6 @@ def planner_decision(discussion: str, recent_text: str = "") -> dict:
         if data.get("mode") == "questions" and isinstance(data.get("questions"), list) and data["questions"]:
             return {"mode": "questions", "questions": [str(item) for item in data["questions"][:4]], "reason": str(data.get("reason", ""))}
     questions = fallback_planner_questions(discussion)
-    if not questions and looks_like_onboarding_agent_request(onboarding_scope):
-        questions = [
-            "Bạn xác nhận mục tiêu onboarding cụ thể trong phiên này là gì (deliverable cuối cùng)?",
-            "Repo/path nào sẽ được áp dụng cho plan này?",
-            "Bạn muốn ưu tiên backend, UI, test hay deploy trước?",
-        ]
     return {"mode": "questions", "questions": questions, "reason": "fallback"}
 
 
@@ -2178,10 +3242,15 @@ def compact_text(value: str, limit: int) -> str:
 
 def clean_facebook_result_text(value: str, limit: int) -> str:
     text = str(value or "").strip()
+    text = re.sub(r"[\U0001D400-\U0001D7FF]", " ", text)
+    text = re.sub(r"[\uFFFD\u200B-\u200D\u2060]", " ", text)
+    text = re.sub(r"[`*_#~<>\[\](){}|\\]", " ", text)
     text = re.sub(r"\bFacebook(?:\s+Facebook)+\b", "Facebook", text, flags=re.I)
     text = re.sub(r"\b(?:Like|Comment|Share|Join|Follow|Thích|Bình luận|Chia sẻ)\b", " ", text, flags=re.I)
     text = re.sub(r"\bSee more\b", " ", text, flags=re.I)
     text = re.sub(r"\b\S+\.comGiang\*?", " ", text, flags=re.I)
+    text = re.sub(r"https?://\S+", " ", text, flags=re.I)
+    text = re.sub(r"\b[a-z0-9]{18,}\b", " ", text, flags=re.I)
     text = re.sub(r"\s+", " ", text).strip(" .:-")
     return compact_text(text, limit)
 
@@ -2218,7 +3287,16 @@ def fallback_host_browser_search_plan(query: str, max_queries: int = 6) -> dict[
         "roleTerms": [],
         "seniorityTerms": [],
         "locationTerms": [],
+        "anchorTerms": [],
+        "locationAliases": [],
         "mustIncludeGroups": [],
+    }
+
+    district_aliases: dict[str, list[str]] = {
+        "go vap": ["go vap", "gò vấp", "gv", "binh thanh", "phu nhuan", "tan binh", "quan 12"],
+        "quan 7": ["quan 7", "q7", "phu my hung", "nha be"],
+        "thu duc": ["thu duc", "q2", "quan 2", "q9", "quan 9", "tp thu duc"],
+        "tan binh": ["tan binh", "san bay", "phu nhuan", "go vap"],
     }
 
     def add_variant(*values: str) -> None:
@@ -2236,17 +3314,26 @@ def fallback_host_browser_search_plan(query: str, max_queries: int = 6) -> dict[
     if any(token in normalized for token in ["devops", "sre", "cloud", "platform", "infra", "infrastructure", "sysadmin"]):
         role_aliases = ["devops", "sre", "cloud", "platform engineer", "infrastructure", "sysadmin"]
         profile["roleTerms"] = ["devops", "sre", "cloud", "platform", "sysadmin", "infra"]
+        profile["anchorTerms"].extend(["devops", "sre", "cloud", "platform", "kubernetes", "docker", "terraform", "cicd"])
         profile["mustIncludeGroups"].append(["devops", "sre", "cloud", "platform", "infra"])
     seniority_aliases: list[str] = []
     if any(token in normalized for token in ["intern", "fresher", "thực tập", "thuc tap", "new grad", "junior", "0-1 năm", "0-1 nam"]):
         seniority_aliases = ["intern", "thực tập sinh", "fresher", "junior", "new grad", "0-1 năm"]
         profile["seniorityTerms"] = ["intern", "thực tập", "thực tập sinh", "fresher", "junior", "new grad"]
+        profile["anchorTerms"].extend(["intern", "thực tập", "thực tập sinh", "fresher", "junior", "không cần kinh nghiệm", "entry level"])
         profile["mustIncludeGroups"].append(["intern", "thực tập", "fresher", "junior", "new grad"])
     location_aliases: list[str] = []
     if any(token in normalized for token in ["hcm", "tphcm", "tp hcm", "ho chi minh", "hcmc", "sài gòn", "sai gon"]):
         location_aliases = ["hcm", "tphcm", "ho chi minh", "hcmc", "sài gòn", "sai gon"]
         profile["locationTerms"] = ["hcm", "tphcm", "hồ chí minh", "sài gòn", "hcmc"]
+        profile["locationAliases"].extend(["hcm", "tphcm", "tp hcm", "ho chi minh", "sai gon", "hcmc"])
         profile["mustIncludeGroups"].append(["hcm", "tphcm", "ho chi minh", "sai gon", "hcmc"])
+    for district, aliases in district_aliases.items():
+        if district in normalized or any(alias in normalized for alias in aliases):
+            profile["locationTerms"].extend(aliases[:3])
+            profile["locationAliases"].extend(aliases)
+            profile["mustIncludeGroups"].append(aliases[:4])
+            break
 
     if has_job:
         intent = "tìm bài tuyển dụng"
@@ -2267,6 +3354,7 @@ def fallback_host_browser_search_plan(query: str, max_queries: int = 6) -> dict[
     elif has_rental:
         intent = "tìm bài cho thuê/trọ"
         criteria = ["đúng bài cho thuê", "giá/khu vực rõ", "ưu tiên bài mới"]
+        profile["anchorTerms"].extend(["nhà trọ", "phòng trọ", "cho thuê", "ở ghép", "studio", "còn phòng"])
         add_variant(
             raw_query.replace("tìm", "cho thuê").replace("tim", "cho thue"),
             raw_query.replace("thuê trọ", "phòng trọ").replace("thue tro", "phong tro"),
@@ -2275,9 +3363,11 @@ def fallback_host_browser_search_plan(query: str, max_queries: int = 6) -> dict[
     elif has_sale:
         intent = "tìm bài mua bán"
         criteria = ["đúng món cần tìm", "giá/tình trạng rõ", "ưu tiên bài mới"]
+        profile["anchorTerms"].extend(["mua", "bán", "pass", "thanh lý", "giá", "tình trạng"])
     elif has_review:
         intent = "tìm bài review/trải nghiệm"
         criteria = ["đúng chủ đề review", "nhiều chi tiết", "ưu tiên bài có trải nghiệm thật"]
+        profile["anchorTerms"].extend(["review", "đánh giá", "trải nghiệm", "ưu nhược điểm"])
 
     return {
         "ok": True,
@@ -2295,16 +3385,18 @@ def host_browser_search_plan(query: str, max_queries: int = 6) -> dict[str, Any]
     cleaned_query = sanitize_facebook_search_query(query)
     fallback = fallback_host_browser_search_plan(cleaned_query, max_queries)
     planner_system_prompt = (
-        "Bạn là search planner cho trợ lý Facebook research. "
-        "Nhiệm vụ: hiểu ý định thật sự của user, tự sinh nhiều biến thể query để tăng recall, "
-        "bao gồm synonym, alias, cách viết khác, role tương đương, location alias và seniority tương đương nếu hợp lý. "
-        "Không chỉ lặp lại query gốc. Trả JSON thuần."
+        "Bạn là search query planner cho Facebook search. "
+        "Nhiệm vụ duy nhất: từ câu người dùng, sinh ra nhiều query search khác nhau để tăng recall. "
+        "Ưu tiên synonym, alias địa điểm, cách diễn đạt khác, biến thể ngắn/gọn và các cách viết tự nhiên dễ match trên Facebook. "
+        "Không cần giải thích. Không cần criteria. Không cần profile. "
+        "Không chỉ đảo vị trí từ. Mỗi query nên đại diện cho một cách tìm khác nhau nếu có thể. "
+        "Trả JSON thuần."
     )
     planner_user_prompt = (
-        "Lập kế hoạch search cho Facebook.\n"
+        "Sinh query search cho Facebook.\n"
         f"User query: {compact_text(cleaned_query, 400)}\n"
         f"Max queries: {max(1, min(int(max_queries or 6), 10))}\n\n"
-        'Trả JSON đúng schema: {"intent":"...","criteria":["..."],"query_variants":["..."],"negative_signals":["..."],"profile":{"original_query":"...","normalized_query":"...","roleTerms":["..."],"seniorityTerms":["..."],"locationTerms":["..."],"mustIncludeGroups":[["..."]]},"summary":"..."}'
+        'Trả JSON đúng schema: {"query_variants":["..."]}'
     )
     started = time.perf_counter()
     result = cliproxy_chat(
@@ -2334,23 +3426,15 @@ def host_browser_search_plan(query: str, max_queries: int = 6) -> dict[str, Any]
     if not cleaned_variants:
         fallback["raw"] = raw[:1800]
         return fallback
-    profile = parsed.get("profile") if isinstance(parsed.get("profile"), dict) else fallback["profile"]
-    for key in ("roleTerms", "seniorityTerms", "locationTerms"):
-        values = profile.get(key) if isinstance(profile.get(key), list) else []
-        profile[key] = [compact_text(str(item), 60) for item in values[:8]]
-    groups = profile.get("mustIncludeGroups") if isinstance(profile.get("mustIncludeGroups"), list) else []
-    profile["mustIncludeGroups"] = [
-        [compact_text(str(item), 60) for item in group[:6]]
-        for group in groups if isinstance(group, list)
-    ][:6]
+    profile = fallback["profile"]
     return {
         "ok": True,
-        "intent": compact_text(str(parsed.get("intent") or fallback.get("intent") or query), 240),
-        "criteria": [compact_text(str(item), 120) for item in (parsed.get("criteria") or [])[:6]],
+        "intent": compact_text(str(fallback.get("intent") or query), 240),
+        "criteria": list(fallback.get("criteria") or []),
         "query_variants": cleaned_variants[: max(1, min(int(max_queries or 6), 10))],
-        "negative_signals": [compact_text(str(item), 120) for item in (parsed.get("negative_signals") or [])[:6]],
+        "negative_signals": list(fallback.get("negative_signals") or []),
         "profile": profile,
-        "summary": compact_text(str(parsed.get("summary") or ""), 400),
+        "summary": "AI generated search query variants.",
         "raw": raw[:1800],
     }
 
@@ -2372,6 +3456,16 @@ def fallback_host_browser_rerank(query: str, items: list[dict[str, Any]], top_k:
     elif review_intent:
         criteria = ["trải nghiệm thực tế", "nhiều chi tiết", "ít xin ý kiến chung chung"]
 
+    role_terms: list[str] = []
+    if job_intent:
+        if any(term in normalized_query for term in ["devops", "cloud", "platform", "sre", "infra", "sysadmin"]):
+            role_terms = ["devops", "cloud", "platform", "sre", "infra", "sysadmin", "kubernetes", "docker", "terraform"]
+    seniority_terms = ["intern", "thực tập", "thuc tap", "fresher", "junior", "entry level", "không cần kinh nghiệm", "khong can kinh nghiem"] if job_intent else []
+    wants_hcm = any(term in normalized_query for term in ["hcm", "tphcm", "tp hcm", "hồ chí minh", "ho chi minh", "sài gòn", "sai gon", "hcmc"])
+    wants_hn = any(term in normalized_query for term in ["hn", "hà nội", "ha noi", "hanoi"])
+    hcm_terms = ["hcm", "tphcm", "tp hcm", "ho chi minh", "hồ chí minh", "sai gon", "sài gòn", "hcmc", "quận", "q."]
+    hn_terms = ["hn", "ha noi", "hà nội", "hanoi", "gia lâm", "gia lam", "cầu giấy", "cau giay"]
+
     ranked: list[dict[str, Any]] = []
     for index, item in enumerate(items[:20]):
         if not isinstance(item, dict):
@@ -2388,10 +3482,18 @@ def fallback_host_browser_rerank(query: str, items: list[dict[str, Any]], top_k:
         hay = blob.lower()
         score = _score_relevance(base_terms, blob) * 2
         reasons: list[str] = []
+        role_hit = any(term in hay for term in role_terms) if role_terms else False
+        seniority_hit = any(term in hay for term in seniority_terms) if seniority_terms else False
+        hcm_hit = any(term in hay for term in hcm_terms)
+        hn_hit = any(term in hay for term in hn_terms)
         is_seeker_post = any(marker in hay for marker in [
             "mình đang tìm", "em đang tìm", "anh đang tìm", "cần tìm", "can tim",
             "tìm gấp", "tim gap", "tim phong", "tìm phòng", "tim tro", "tìm trọ",
             "looking for", "need to find", "xin review", "ai review",
+        ])
+        is_aggregate_post = any(marker in hay for marker in [
+            "góc nghề nghiệp", "goc nghe nghiep", "tổng hợp thông tin tuyển dụng", "tong hop thong tin tuyen dung",
+            "forum trường", "forum truong", "box việc làm", "box viec lam", "săn job", "san job"
         ])
         if any(marker in hay for marker in [" giờ", "gio", "hôm nay", "hom nay", "phút", "phut", "mới", "moi", "today", "hour", "hours"]):
             score += 1
@@ -2413,6 +3515,37 @@ def fallback_host_browser_rerank(query: str, items: list[dict[str, Any]], top_k:
             if is_seeker_post or any(marker in hay for marker in ["mình đang tìm việc", "em đang tìm việc", "looking for job", "tìm cơ hội", "tim viec"]):
                 score -= 6
                 reasons.append("bài ứng viên đi tìm việc")
+            if role_terms:
+                if role_hit:
+                    score += 5
+                    reasons.append("đúng role chính")
+                else:
+                    score -= 4
+                    reasons.append("không đúng role chính")
+            if seniority_terms:
+                if seniority_hit:
+                    score += 3
+                    reasons.append("đúng seniority")
+                else:
+                    score -= 2
+                    reasons.append("thiếu tín hiệu intern/fresher")
+            if wants_hcm:
+                if hcm_hit:
+                    score += 2
+                    reasons.append("khớp khu vực HCM")
+                elif hn_hit:
+                    score -= 200
+                    reasons.append("sai khu vực, nghiêng Hà Nội")
+            elif wants_hn:
+                if hn_hit:
+                    score += 2
+                    reasons.append("khớp khu vực Hà Nội")
+                elif hcm_hit:
+                    score -= 30
+                    reasons.append("sai khu vực, nghiêng HCM")
+            if is_aggregate_post:
+                score -= 30
+                reasons.append("bài tổng hợp/forum")
         elif sale_intent:
             if any(marker in hay for marker in ["bán", "ban ", "pass", "thanh lý", "thanh ly", "new", "99%"]) and not is_seeker_post:
                 score += 4
@@ -2442,10 +3575,55 @@ def fallback_host_browser_rerank(query: str, items: list[dict[str, Any]], top_k:
 
 
 def host_browser_rerank(query: str, items: list[dict[str, Any]], top_k: int = 5) -> dict[str, Any]:
+    rerank_plan = fallback_host_browser_search_plan(query, 4)
+    rerank_profile = rerank_plan.get("profile") if isinstance(rerank_plan, dict) else {}
+    role_terms = rerank_profile.get("roleTerms") if isinstance(rerank_profile, dict) and isinstance(rerank_profile.get("roleTerms"), list) else []
+    seniority_terms = rerank_profile.get("seniorityTerms") if isinstance(rerank_profile, dict) and isinstance(rerank_profile.get("seniorityTerms"), list) else []
+    location_terms = rerank_profile.get("locationTerms") if isinstance(rerank_profile, dict) and isinstance(rerank_profile.get("locationTerms"), list) else []
+    location_aliases = rerank_profile.get("locationAliases") if isinstance(rerank_profile, dict) and isinstance(rerank_profile.get("locationAliases"), list) else []
+    must_include_groups = rerank_profile.get("mustIncludeGroups") if isinstance(rerank_profile, dict) and isinstance(rerank_profile.get("mustIncludeGroups"), list) else []
+    lowered_query = str(query or "").lower()
+    wants_hcm = any(term in lowered_query for term in ["hcm", "tphcm", "tp hcm", "hồ chí minh", "ho chi minh", "sài gòn", "sai gon", "hcmc"])
+    wants_hn = any(term in lowered_query for term in ["hn", "hà nội", "ha noi", "hanoi"])
+    hcm_terms = ["hcm", "tphcm", "tp hcm", "ho chi minh", "hồ chí minh", "sai gon", "sài gòn", "hcmc", "quận", "q."]
+    hn_terms = ["hn", "ha noi", "hà nội", "hanoi", "gia lâm", "gia lam", "cầu giấy", "cau giay"]
+
     trimmed_items: list[dict[str, Any]] = []
     for index, item in enumerate(items[:20]):
         if not isinstance(item, dict):
             continue
+        blob = "\n".join(
+            [
+                str(item.get("author") or ""),
+                str(item.get("text") or ""),
+                str(item.get("excerpt") or ""),
+                str(item.get("time_hint") or ""),
+                str(item.get("query_used") or ""),
+            ]
+        )
+        hay = blob.lower()
+        role_hit = any(term.lower() in hay for term in role_terms) if role_terms else False
+        seniority_hit = any(term.lower() in hay for term in seniority_terms) if seniority_terms else False
+        location_hit = any(term.lower() in hay for term in (location_terms or location_aliases)) if (location_terms or location_aliases) else False
+        location_mismatch = (wants_hcm and any(term in hay for term in hn_terms) and not any(term in hay for term in hcm_terms)) or (
+            wants_hn and any(term in hay for term in hcm_terms) and not any(term in hay for term in hn_terms)
+        )
+        aggregate_post = any(marker in hay for marker in [
+            "góc nghề nghiệp", "goc nghe nghiep", "tổng hợp", "tong hop", "forum", "box việc làm", "box viec lam", "săn job", "san job"
+        ])
+        seeker_post = any(marker in hay for marker in [
+            "mình đang tìm", "em đang tìm", "anh đang tìm", "looking for job", "mình đang tìm việc", "em đang tìm việc", "cần tìm", "can tim"
+        ])
+        semantic_group_hits: list[str] = []
+        if role_hit:
+            semantic_group_hits.append("role")
+        if seniority_hit:
+            semantic_group_hits.append("seniority")
+        if location_hit:
+            semantic_group_hits.append("location")
+        for group in must_include_groups[:4]:
+            if isinstance(group, list) and any(str(term).lower() in hay for term in group):
+                semantic_group_hits.append("group:" + "/".join(str(term) for term in group[:2]))
         trimmed_items.append(
             {
                 "index": index,
@@ -2457,6 +3635,13 @@ def host_browser_rerank(query: str, items: list[dict[str, Any]], top_k: int = 5)
                 "query_used": compact_text(str(item.get("query_used") or ""), 200),
                 "score": item.get("score"),
                 "reasons": item.get("reasons") if isinstance(item.get("reasons"), list) else [],
+                "role_hit": role_hit,
+                "seniority_hit": seniority_hit,
+                "location_hit": location_hit,
+                "location_mismatch": location_mismatch,
+                "aggregate_post": aggregate_post,
+                "seeker_post": seeker_post,
+                "semantic_group_hits": semantic_group_hits[:6],
             }
         )
     if not trimmed_items:
@@ -2464,22 +3649,34 @@ def host_browser_rerank(query: str, items: list[dict[str, Any]], top_k: int = 5)
 
     rerank_system_prompt = (
         "Bạn là bộ xếp hạng candidate bài Facebook theo kiểu trợ lý thông minh. "
-        "Nhiệm vụ: suy ra ý định thật sự từ query, tự quyết tiêu chí phù hợp với ý định đó, "
-        "rồi xếp hạng candidate nào đáng đưa lên đầu. "
+        "Nhiệm vụ: suy ra ý định thật sự từ query, tự quyết tiêu chí phù hợp với ý định đó, rồi xếp hạng candidate nào đáng đưa lên đầu. "
         "Không được mặc định đây là tìm việc; có thể là tìm trọ, mua bán, review, drama, thông báo, dịch vụ hoặc chủ đề khác. "
+        "Phải hiểu match theo cụm nghĩa, không chỉ exact token. Ví dụ intern ~ thực tập ~ fresher ~ junior; "
+        "devops ~ cloud ~ platform ~ sre ~ infra; hcm ~ tphcm ~ hồ chí minh ~ sài gòn. "
         "Ưu tiên bài đáp ứng đúng mục tiêu, thông tin cụ thể, độ mới nếu đọc được ngày/giờ, và loại bỏ bài chỉ liên quan lỏng. "
+        "Nếu query có role/location cụ thể thì bài sai role hoặc sai location phải bị hạ rất mạnh. "
+        "Không được xếp bài sai location rõ ràng hoặc sai role rõ ràng vào top 2 nếu vẫn còn bài khớp tốt hơn. "
+        "Bài tổng hợp/forum/repost yếu hơn bài gốc trực tiếp. "
         "Trả JSON thuần, không markdown."
     )
     rerank_user_prompt = (
         "Xếp hạng các candidate Facebook sau theo đúng ý định của người dùng.\n"
         f"User query: {compact_text(query, 500)}\n\n"
+        f"Semantic profile: {json.dumps({'role_terms': role_terms, 'seniority_terms': seniority_terms, 'location_terms': location_terms, 'location_aliases': location_aliases, 'must_include_groups': must_include_groups}, ensure_ascii=False)}\n\n"
         "Yêu cầu:\n"
         "- Tự suy ra intent.\n"
         "- Tự nêu 3-6 tiêu chí xếp hạng ngắn gọn.\n"
         "- Chỉ dùng index có trong danh sách.\n"
         "- Ưu tiên bài phù hợp nhất, bài mới hơn nếu có tín hiệu thời gian, và bài có chi tiết thực chất.\n"
-        "- Nếu một bài là sai vai trò/ngược nhu cầu (ví dụ người đi tìm việc thay vì bài tuyển), hạ hạng mạnh.\n\n"
-        'Trả JSON đúng schema: {"intent":"...","criteria":["..."],"summary":"...","ranked_items":[{"index":0,"score":0-10,"verdict":"strong|medium|weak","reason":"..."}]}\n\n'
+        "- Match theo meaning/synonym, không chỉ exact text.\n"
+        "- Nếu một bài là sai vai trò/ngược nhu cầu (ví dụ người đi tìm việc thay vì bài tuyển), hạ hạng mạnh.\n"
+        "- Nếu query có location cụ thể và candidate có `location_mismatch=true`, hạ rất mạnh; gần như không cho vào top 2.\n"
+        "- Nếu query có role cụ thể và candidate thiếu role chính, không cho vào top 2 nếu còn candidate khác khớp role.\n"
+        "- Candidate có `aggregate_post=true` hoặc `seeker_post=true` phải đứng dưới bài trực tiếp/gốc.\n\n"
+        "- Với mỗi candidate được xếp hạng, hãy viết lại tiêu đề hiển thị ngắn gọn, sạch, tối đa 90 ký tự vào `display_title`.\n"
+        "- Với mỗi candidate được xếp hạng, hãy viết lại tóm tắt hiển thị ngắn gọn, sạch, tối đa 180 ký tự vào `display_summary`.\n"
+        "- Không copy nguyên chuỗi rác, id dài, markdown thô, ký tự loạn, hoặc text bẩn từ DOM vào display_title/display_summary.\n\n"
+        'Trả JSON đúng schema: {"intent":"...","criteria":["..."],"summary":"...","ranked_items":[{"index":0,"score":0-10,"verdict":"strong|medium|weak","reason":"...","display_title":"...","display_summary":"..."}]}\n\n'
         f"Candidates:\n{json.dumps(trimmed_items, ensure_ascii=False)}"
     )
     started = time.perf_counter()
@@ -2527,6 +3724,8 @@ def host_browser_rerank(query: str, items: list[dict[str, Any]], top_k: int = 5)
                 "score": score,
                 "verdict": verdict,
                 "reason": compact_text(str(entry.get("reason") or ""), 320),
+                "display_title": compact_text(str(entry.get("display_title") or ""), 120),
+                "display_summary": compact_text(str(entry.get("display_summary") or ""), 240),
             }
         )
     if not normalized_ranked:
@@ -2542,6 +3741,148 @@ def host_browser_rerank(query: str, items: list[dict[str, Any]], top_k: int = 5)
         "ranked_items": normalized_ranked[: max(1, min(int(top_k or 5), 10))],
         "raw": raw[:2400],
     }
+
+
+def canonicalize_facebook_result_url(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw or "facebook.com" not in raw.lower():
+        return ""
+    try:
+        parsed = urlparse(raw)
+    except Exception:
+        return ""
+    path = parsed.path or ""
+    query_pairs = parse_qsl(parsed.query, keep_blank_values=True)
+    query_map = {k: v for k, v in query_pairs}
+    lowered = raw.lower()
+    if "/commerce/listing/" in lowered:
+        cleaned_pairs = [(k, v) for k, v in query_pairs if k in {"media_id", "ref"} and v]
+        query = urlencode(cleaned_pairs)
+        return urlunparse((parsed.scheme or "https", parsed.netloc, path, "", query, ""))
+    if "/permalink/" in lowered or "/posts/" in lowered or "story_fbid=" in lowered or "permalink.php" in lowered:
+        keep_keys = ("story_fbid", "id", "post_id")
+        cleaned_pairs = [(k, query_map[k]) for k in keep_keys if k in query_map and query_map[k]]
+        query = urlencode(cleaned_pairs)
+        return urlunparse((parsed.scheme or "https", parsed.netloc, path, "", query, ""))
+    if "/photo/?" in lowered or "fbid=" in lowered:
+        keep_keys = ("fbid", "set", "idorvanity")
+        cleaned_pairs = [(k, query_map[k]) for k in keep_keys if k in query_map and query_map[k]]
+        if not cleaned_pairs:
+            return ""
+        query = urlencode(cleaned_pairs)
+        return urlunparse((parsed.scheme or "https", parsed.netloc, path or "/photo/", "", query, ""))
+    return ""
+
+
+def build_facebook_research_candidates(query: str, bridge_result: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_items = bridge_result.get("items") if isinstance(bridge_result.get("items"), list) else []
+    if not raw_items:
+        raw_items = bridge_result.get("top_items") if isinstance(bridge_result.get("top_items"), list) else []
+    candidates: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
+    for index, item in enumerate(raw_items):
+        if not isinstance(item, dict):
+            continue
+        raw_url = str(
+            item.get("url")
+            or item.get("link")
+            or item.get("photoOnlyUrl")
+            or item.get("photo_only_url")
+            or ""
+        )
+        canonical_url = canonicalize_facebook_result_url(raw_url)
+        text = compact_text(str(item.get("text") or ""), 1600)
+        image_text = compact_text(str(item.get("image_text") or item.get("imageText") or ""), 1600)
+        merged_text = text or image_text
+        if not canonical_url or canonical_url in seen_urls or not merged_text:
+            continue
+        seen_urls.add(canonical_url)
+        excerpt = compact_text(merged_text, 320)
+        candidates.append(
+            {
+                "index": index,
+                "url": canonical_url,
+                "raw_url": raw_url,
+                "author": "",
+                "text": merged_text,
+                "excerpt": excerpt,
+                "time_hint": "",
+                "query_used": query,
+                "score": item.get("score"),
+                "reasons": [],
+                "source_text": text,
+                "source_image_text": image_text,
+            }
+        )
+    return candidates
+
+
+def build_host_browser_facebook_research_result(payload: HostBrowserFacebookResearchRequest) -> dict[str, Any]:
+    data = host_browser_call("/facebook-research", payload.model_dump(), timeout=240)
+    bridge_result = data.get("result") if isinstance(data.get("result"), dict) else {}
+    candidates = build_facebook_research_candidates(payload.query, bridge_result)
+    rerank_error = ""
+    rerank: dict[str, Any] = {"ok": False, "summary": "", "criteria": [], "ranked_items": []}
+    if candidates:
+        try:
+            rerank = host_browser_rerank(payload.query, candidates, payload.limit)
+        except Exception as exc:
+            rerank_error = compact_text(str(exc), 320)
+            rerank = {"ok": False, "summary": "", "criteria": [], "ranked_items": []}
+    ranked_items = rerank.get("ranked_items") if isinstance(rerank.get("ranked_items"), list) else []
+    results: list[dict[str, Any]] = []
+    for rank_index, entry in enumerate(ranked_items, start=1):
+        if not isinstance(entry, dict):
+            continue
+        try:
+            source_index = int(entry.get("index"))
+        except (TypeError, ValueError):
+            continue
+        if source_index < 0 or source_index >= len(candidates):
+            continue
+        source = candidates[source_index]
+        display_title = compact_text(str(entry.get("display_title") or ""), 120) or compact_text(str(source.get("excerpt") or "").split(".")[0], 120) or f"Bài {rank_index}"
+        display_summary = compact_text(str(entry.get("display_summary") or ""), 240) or compact_text(str(source.get("excerpt") or ""), 240)
+        results.append(
+            {
+                "rank": rank_index,
+                "author": display_title,
+                "summary": display_summary,
+                "keep_reason": compact_text(str(entry.get("reason") or ""), 320),
+                "time_status": "",
+                "url": str(source.get("url") or ""),
+                "raw_url": str(source.get("raw_url") or ""),
+                "text": str(source.get("text") or ""),
+            }
+        )
+    if not results and candidates:
+        for rank_index, source in enumerate(candidates[: max(1, min(int(payload.limit or 5), 10))], start=1):
+            results.append(
+                {
+                    "rank": rank_index,
+                    "author": compact_text(str(source.get("excerpt") or "").split(".")[0], 120) or f"Bài {rank_index}",
+                    "summary": compact_text(str(source.get("excerpt") or source.get("text") or ""), 240),
+                    "keep_reason": "Fallback ordering from bridge results",
+                    "time_status": "",
+                    "url": str(source.get("url") or ""),
+                    "raw_url": str(source.get("raw_url") or ""),
+                    "text": str(source.get("text") or ""),
+                }
+            )
+    result_payload = {
+        **bridge_result,
+        "items": candidates,
+        "results": results,
+        "summary": {
+            "planner_summary": "",
+            "rerank_summary": str(rerank.get("summary") or rerank_error or ""),
+            "criteria": rerank.get("criteria") if isinstance(rerank.get("criteria"), list) else [],
+            "recent_confirmed_count": 0,
+            "time_unknown_count": 0,
+            "stale_confirmed_count": 0,
+        },
+    }
+    return {"ok": True, "bridge_url": host_browser_bridge_url(), "result": result_payload}
 
 
 def is_duplicate_user_message(job: dict, content: str, window_seconds: int = 3) -> bool:
@@ -2813,12 +4154,26 @@ def sanitize_manager_content(value: str, fallback: str | None = None) -> str:
     )
 
 
+def _compact_lines(lines: list[str], limit: int, max_chars: int) -> str:
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw in lines:
+        text = compact_text(str(raw or "").strip(), max_chars)
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+        if len(out) >= limit:
+            break
+    return "\n".join(out)
+
+
 def refresh_session_memory(job_id: str) -> dict:
     job = db.get_job(job_id)
     if not job:
         return db.default_session_memory(job_id)
     db.upsert_user_preference("last_active_job_id", str(job_id), source="system")
-    db.upsert_user_preference("last_permission_mode", str(job.get("permission_mode") or "auto_review"), source="system")
+    db.upsert_user_preference("last_permission_mode", str(job.get("permission_mode") or "full_access"), source="system")
     user_messages = [m for m in job.get("messages", []) if m.get("role") == "user" and m.get("content")]
     manager_messages = [m for m in job.get("messages", []) if is_assistant_message(m)]
     recent = [
@@ -2829,12 +4184,16 @@ def refresh_session_memory(job_id: str) -> dict:
     pending = [a for a in job.get("pending_actions", []) if a.get("status") == "pending"]
     completed = [a for a in job.get("pending_actions", []) if a.get("status") in {"done", "failed", "rejected"}]
     current_goal = compact_text((user_messages[-1]["content"] if user_messages else job.get("request") or job.get("title") or ""), 600)
-    open_tasks = "\n".join(f"- #{a.get('id')} {a.get('title')} ({a.get('kind')})" for a in pending[:8])
-    important_files = "\n".join(f"- {f.get('name')} ({len(str(f.get('content', '')))} chars)" for f in job.get("focus_files", [])[:12])
-    decisions = "\n".join(
+    open_tasks = _compact_lines([f"- #{a.get('id')} {a.get('title')} ({a.get('kind')})" for a in pending[:8]], 8, 160)
+    important_files = _compact_lines([f"- {f.get('name')} ({len(str(f.get('content', '')))} chars)" for f in job.get("focus_files", [])[:12]], 12, 160)
+    decisions = _compact_lines(
+        [
         f"- {compact_text(m.get('content', ''), 240)}"
         for m in manager_messages[-5:]
         if any(marker in str(m.get("content", "")).lower() for marker in ["đã", "cần", "sẽ", "approve", "action", "plan"])
+        ],
+        5,
+        240,
     )
     raw_last_result = job.get("result") or job.get("error") or (completed[-1].get("result") or completed[-1].get("error") if completed else "") or (manager_messages[-1]["content"] if manager_messages else "")
     if completed and (completed[-1].get("result") or completed[-1].get("error")) and not (job.get("result") or job.get("error")):
@@ -2844,7 +4203,7 @@ def refresh_session_memory(job_id: str) -> dict:
     summary = (
         f"Mục tiêu: {current_goal or 'Chưa rõ'}\n"
         f"Trạng thái: {job.get('status')}\n"
-        f"Gần đây:\n" + "\n".join(f"- {line}" for line in recent)
+        f"Gần đây:\n" + _compact_lines([f"- {line}" for line in recent], 8, 180)
     )[:3000]
     return db.upsert_session_memory(
         job_id,
@@ -2854,6 +4213,41 @@ def refresh_session_memory(job_id: str) -> dict:
         important_files=important_files,
         decisions=decisions,
         last_result=last_result,
+    )
+
+
+def queue_verification_follow_up(job_id: str, verification: dict[str, Any]) -> None:
+    job = db.get_job(job_id)
+    if not job:
+        return
+    existing = [a for a in job.get("pending_actions", []) if str(a.get("status") or "") == "pending" and str(a.get("kind") or "") == "note"]
+    if any("Review failed verification" in str(a.get("title") or "") for a in existing):
+        return
+    missing = verification.get("missing_requirements") if isinstance(verification.get("missing_requirements"), list) else []
+    tool_details = verification.get("tool_failure_details") if isinstance(verification.get("tool_failure_details"), list) else []
+    preview = compact_text(
+        "Missing: "
+        + (", ".join(str(item) for item in missing[:6]) or "unknown")
+        + " | Tool failures: "
+        + (", ".join(str(item) for item in tool_details[:6]) or "none"),
+        400,
+    )
+    db.add_pending_action(
+        job_id,
+        "note",
+        "Review failed verification evidence",
+        preview,
+        {
+            "note": preview,
+            "kind": "verification_follow_up",
+            "missing_requirements": missing,
+            "tool_failure_details": tool_details,
+        },
+    )
+    db.add_message(
+        job_id,
+        "langgraph",
+        "Mình đã xếp sẵn một follow-up action để review verification lỗi trước khi retry.",
     )
 
 
@@ -3096,18 +4490,6 @@ def memory_context(job_id: str | None = None) -> str:
             ),
             reverse=True,
         )[:4]
-        for item in ranked_projects:
-            aux_lines.append(
-                f"- project {item.get('name')} root={item.get('root_path') or '-'} :: "
-                f"{str(item.get('summary', ''))[:220]} | memory: {str(item.get('memory', ''))[:280]}"
-            )
-        for item in ranked_commands:
-            aux_lines.append(f"- command /{item.get('name')} -> {item.get('action_kind')} :: {str(item.get('description', ''))[:180]}")
-        for item in ranked_plugins:
-            aux_lines.append(
-                f"- plugin {item.get('name')} role={item.get('role') or '-'} tools={item.get('tool_hints') or '-'} :: "
-                f"{str(item.get('instructions', item.get('description', '')))[:220]}"
-            )
         # Route memory: prioritize proven paths by win-rate and evidence volume.
         ranked_routes = sorted(
             route_rows,
@@ -3129,6 +4511,18 @@ def memory_context(job_id: str | None = None) -> str:
             aux_lines.append(
                 f"- successful_route task={item.get('task_signature')} route={item.get('route')} "
                 f"win_rate={win_rate} success={success} failure={failure} last={item.get('updated_at') or '-'}"
+            )
+        for item in ranked_projects:
+            aux_lines.append(
+                f"- project {item.get('name')} root={item.get('root_path') or '-'} :: "
+                f"{str(item.get('summary', ''))[:220]} | memory: {str(item.get('memory', ''))[:280]}"
+            )
+        for item in ranked_commands:
+            aux_lines.append(f"- command /{item.get('name')} -> {item.get('action_kind')} :: {str(item.get('description', ''))[:180]}")
+        for item in ranked_plugins:
+            aux_lines.append(
+                f"- plugin {item.get('name')} role={item.get('role') or '-'} tools={item.get('tool_hints') or '-'} :: "
+                f"{str(item.get('instructions', item.get('description', '')))[:220]}"
             )
         for item in recurring[:3]:
             aux_lines.append(
@@ -3390,13 +4784,664 @@ def host_browser_bridge_url() -> str:
     return os.getenv("HOST_BROWSER_BRIDGE_URL", "http://host.docker.internal:3342").strip().rstrip("/")
 
 
+HOST_BROWSER_AUTOSTART_LOCK = threading.Lock()
+HOST_BROWSER_AUTOSTART_PROCESS: subprocess.Popen[str] | None = None
+
+
+def _host_browser_default_command(base_url: str) -> list[str] | None:
+    parsed = urlparse(base_url)
+    host = (parsed.hostname or "").strip().lower()
+    port = parsed.port or 3342
+    bind_host = "127.0.0.1"
+    tools_dir = APP_DIR.parent.parent / "tools"
+    mjs_path = tools_dir / "host_browser_bridge.mjs"
+    ps1_path = tools_dir / "host_browser_bridge.ps1"
+    node_bin = shutil.which("node")
+    pwsh_bin = shutil.which("pwsh") or shutil.which("powershell")
+
+    if host not in {"127.0.0.1", "localhost", "0.0.0.0"}:
+        return None
+    if mjs_path.exists() and node_bin:
+        return [node_bin, str(mjs_path)]
+    if ps1_path.exists() and pwsh_bin:
+        return [pwsh_bin, "-File", str(ps1_path), "-Port", str(port), "-Bind", f"http://{bind_host}"]
+    return None
+
+
+def _host_browser_autostart_command(base_url: str) -> list[str] | None:
+    raw = str(os.getenv("HOST_BROWSER_BRIDGE_COMMAND") or "").strip()
+    if raw:
+        return shlex.split(raw)
+    return _host_browser_default_command(base_url)
+
+
+def _host_browser_runtime_guidance(base_url: str) -> str:
+    base = base_url or "http://host.docker.internal:3342"
+    command = "node tools/host_browser_bridge.mjs"
+    if Path("/.dockerenv").exists():
+        return (
+            f"Host browser bridge chưa reachable tại {base}. "
+            f"Stack hiện chạy trong Docker nên manager không thể tự mở browser bridge trên desktop host. "
+            f"Hãy chạy `{command}` trên máy host, hoặc trỏ `HOST_BROWSER_BRIDGE_URL` sang bridge đang chạy sẵn."
+        )
+    return (
+        f"Host browser bridge chưa reachable tại {base}. "
+        f"Hãy chạy `{command}` trong repo này, hoặc cấu hình `HOST_BROWSER_BRIDGE_COMMAND` nếu muốn app tự spawn bridge."
+    )
+
+
+def ensure_host_browser_bridge_running(timeout: float = 4.0) -> None:
+    base = host_browser_bridge_url()
+    if not base:
+        raise RuntimeError("HOST_BROWSER_BRIDGE_URL is empty")
+    try:
+        http_json("GET", f"{base}/health", timeout=max(1, int(timeout)))
+        return
+    except Exception:
+        pass
+
+    command = _host_browser_autostart_command(base)
+    if not command:
+        raise RuntimeError(_host_browser_runtime_guidance(base))
+
+    global HOST_BROWSER_AUTOSTART_PROCESS
+    with HOST_BROWSER_AUTOSTART_LOCK:
+        process = HOST_BROWSER_AUTOSTART_PROCESS
+        if process is None or process.poll() is not None:
+            try:
+                HOST_BROWSER_AUTOSTART_PROCESS = subprocess.Popen(
+                    command,
+                    cwd=str(APP_DIR.parent.parent),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"{_host_browser_runtime_guidance(base)} Autostart command failed: {exc}"
+                ) from exc
+
+    deadline = time.monotonic() + max(1.0, timeout)
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            http_json("GET", f"{base}/health", timeout=2)
+            return
+        except Exception as exc:
+            last_error = exc
+            time.sleep(0.2)
+    detail = f" Last error: {last_error}" if last_error else ""
+    raise RuntimeError(f"{_host_browser_runtime_guidance(base)}{detail}")
+
+
 def host_browser_call(path: str, payload: dict[str, Any] | None = None, method: str = "POST", timeout: int = 30) -> dict[str, Any]:
     base = host_browser_bridge_url()
     if not base:
         raise RuntimeError("HOST_BROWSER_BRIDGE_URL is empty")
+    ensure_host_browser_bridge_running(timeout=min(float(timeout), 5.0))
     verb = method.upper()
     use_payload = payload if verb != "GET" else None
     return http_json(verb, f"{base}{path}", payload=use_payload, timeout=timeout)
+
+
+def _mark_host_worker_transport(result: dict[str, Any], transport: str) -> dict[str, Any]:
+    data = result.get("data")
+    if isinstance(data, dict) and not str(data.get("transport") or "").strip():
+        data["transport"] = transport
+    return result
+
+
+def _try_host_worker_call(path: str, payload: dict[str, Any] | None = None, method: str = "POST", timeout: int = 30) -> tuple[bool, dict[str, Any] | str]:
+    try:
+        result = host_browser_call(path, payload=payload, method=method, timeout=timeout)
+    except Exception as exc:
+        return False, str(exc)
+    if isinstance(result, dict):
+        return True, _mark_host_worker_transport(result, "host_worker")
+    return True, {"ok": False, "summary": f"Host worker returned invalid payload for {path}", "data": {"transport": "host_worker"}}
+
+
+def _resolve_host_path(raw_path: str) -> Path:
+    candidate = Path(str(raw_path or "")).expanduser()
+    if not candidate.is_absolute():
+        candidate = (Path("/home/giang") / candidate).resolve()
+    else:
+        candidate = candidate.resolve()
+    for root in HOST_ALLOWED_ROOTS:
+        try:
+            candidate.relative_to(root)
+            return candidate
+        except ValueError:
+            continue
+    raise ValueError(f"host path is outside allowed roots: {candidate}")
+
+
+def _check_host_command_policy(command: str) -> tuple[bool, str]:
+    raw = str(command or "").strip().lower()
+    if not raw:
+        return False, "empty host command"
+    blocked_patterns = [
+        r"\brm\s+-rf\s+/(?:\s|$)",
+        r"\bmkfs\b",
+        r"\bdd\s+if=",
+        r"\bshutdown\b",
+        r"\breboot\b",
+        r"\bpoweroff\b",
+        r"\buserdel\b",
+        r"\bmount\b",
+        r"\bumount\b",
+    ]
+    if any(re.search(pattern, raw) for pattern in blocked_patterns):
+        return False, "host policy blocked destructive machine command"
+    return True, "host policy allowed command"
+
+
+def _run_host_operator_command(argv: list[str], timeout: int = 20, cwd: str = "/home/giang") -> dict[str, Any]:
+    try:
+        completed = subprocess.run(
+            argv,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=max(1, int(timeout)),
+        )
+    except FileNotFoundError:
+        return {
+            "ok": False,
+            "summary": f"Host operator command not available: {argv[0]}",
+            "data": {"argv": argv, "cwd": cwd},
+        }
+    except subprocess.TimeoutExpired:
+        return {
+            "ok": False,
+            "summary": f"Host operator command timed out: {' '.join(argv)}",
+            "data": {"argv": argv, "cwd": cwd},
+        }
+    return {
+        "ok": completed.returncode == 0,
+        "summary": f"Host operator command {'completed' if completed.returncode == 0 else 'failed'}: {' '.join(argv)}",
+        "data": {
+            "argv": argv,
+            "cwd": cwd,
+            "returncode": completed.returncode,
+            "stdout": completed.stdout,
+            "stderr": completed.stderr,
+        },
+    }
+
+
+def run_host_shell_action(command: str, cwd: str = "", timeout: int = 60) -> dict[str, Any]:
+    allowed, reason = _check_host_command_policy(command)
+    if not allowed:
+        return {"ok": False, "summary": reason, "data": {"command": command, "cwd": cwd}}
+    remote_ok, remote_result = _try_host_worker_call(
+        "/shell/run",
+        {"command": command, "cwd": cwd, "timeout": timeout},
+        timeout=timeout,
+    )
+    if remote_ok:
+        return remote_result if isinstance(remote_result, dict) else {"ok": False, "summary": str(remote_result), "data": {"transport": "host_worker"}}
+    target_cwd = str(_resolve_host_path(cwd or "/home/giang"))
+    try:
+        completed = subprocess.run(
+            ["sh", "-lc", command],
+            cwd=target_cwd,
+            capture_output=True,
+            text=True,
+            timeout=max(1, int(timeout)),
+        )
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "summary": "Host shell command timed out", "data": {"command": command, "cwd": target_cwd}}
+    payload = {
+        "command": command,
+        "cwd": target_cwd,
+        "policy": reason,
+        "returncode": completed.returncode,
+        "stdout": completed.stdout,
+        "stderr": completed.stderr,
+        "transport": "manager_local_fallback",
+        "worker_error": str(remote_result),
+    }
+    return {
+        "ok": completed.returncode == 0,
+        "summary": f"Host shell command {'completed' if completed.returncode == 0 else 'failed'}: {command}",
+        "data": payload,
+    }
+
+
+def read_host_file(path: str, max_chars: int = 40000) -> dict[str, Any]:
+    remote_ok, remote_result = _try_host_worker_call(
+        "/files/read",
+        {"path": path, "max_chars": max_chars},
+        timeout=20,
+    )
+    if remote_ok:
+        return remote_result if isinstance(remote_result, dict) else {"ok": False, "summary": str(remote_result), "data": {"transport": "host_worker"}}
+    target = _resolve_host_path(path)
+    if not target.exists():
+        return {"ok": False, "summary": f"host file not found: {target}", "data": {"path": str(target)}}
+    if not target.is_file():
+        return {"ok": False, "summary": f"host path is not a file: {target}", "data": {"path": str(target)}}
+    text = target.read_text(encoding="utf-8", errors="replace")
+    return {
+        "ok": True,
+        "summary": f"Read host file: {target}",
+        "data": {
+            "path": str(target),
+            "content": text[: max(1, int(max_chars))],
+            "bytes": target.stat().st_size,
+            "transport": "manager_local_fallback",
+            "worker_error": str(remote_result),
+        },
+    }
+
+
+def list_host_files(path: str, limit: int = 200) -> dict[str, Any]:
+    remote_ok, remote_result = _try_host_worker_call(
+        "/files/list",
+        {"path": path, "limit": limit},
+        timeout=20,
+    )
+    if remote_ok:
+        return remote_result if isinstance(remote_result, dict) else {"ok": False, "summary": str(remote_result), "data": {"transport": "host_worker"}}
+    target = _resolve_host_path(path)
+    if not target.exists():
+        return {"ok": False, "summary": f"host path not found: {target}", "data": {"path": str(target)}}
+    if not target.is_dir():
+        return {"ok": False, "summary": f"host path is not a directory: {target}", "data": {"path": str(target)}}
+    entries = []
+    for item in sorted(target.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))[: max(1, int(limit))]:
+        entries.append(
+            {
+                "name": item.name,
+                "path": str(item),
+                "type": "dir" if item.is_dir() else "file",
+                "size": item.stat().st_size if item.is_file() else None,
+            }
+        )
+    return {
+        "ok": True,
+        "summary": f"Listed host directory: {target}",
+        "data": {"path": str(target), "entries": entries, "transport": "manager_local_fallback", "worker_error": str(remote_result)},
+    }
+
+
+def write_host_file(path: str, content: str = "", overwrite: bool = True, create_parents: bool = False) -> dict[str, Any]:
+    remote_ok, remote_result = _try_host_worker_call(
+        "/files/write",
+        {"path": path, "content": content, "overwrite": overwrite, "create_parents": create_parents},
+        timeout=30,
+    )
+    if remote_ok:
+        return remote_result if isinstance(remote_result, dict) else {"ok": False, "summary": str(remote_result), "data": {"transport": "host_worker"}}
+    target = _resolve_host_path(path)
+    if target.exists() and not overwrite:
+        return {"ok": False, "summary": f"host file already exists: {target}", "data": {"path": str(target)}}
+    parent = target.parent
+    if not parent.exists():
+        if not create_parents:
+            return {"ok": False, "summary": f"host parent directory not found: {parent}", "data": {"path": str(target)}}
+        parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(str(content or ""), encoding="utf-8")
+    return {
+        "ok": True,
+        "summary": f"Wrote host file: {target}",
+        "data": {
+            "path": str(target),
+            "bytes": len(str(content or "").encode("utf-8")),
+            "transport": "manager_local_fallback",
+            "worker_error": str(remote_result),
+        },
+    }
+
+
+def move_host_file(src_path: str, dest_path: str, overwrite: bool = False, create_parents: bool = False) -> dict[str, Any]:
+    remote_ok, remote_result = _try_host_worker_call(
+        "/files/move",
+        {
+            "src_path": src_path,
+            "dest_path": dest_path,
+            "overwrite": overwrite,
+            "create_parents": create_parents,
+        },
+        timeout=30,
+    )
+    if remote_ok:
+        return remote_result if isinstance(remote_result, dict) else {"ok": False, "summary": str(remote_result), "data": {"transport": "host_worker"}}
+    src = _resolve_host_path(src_path)
+    dest = _resolve_host_path(dest_path)
+    if not src.exists():
+        return {"ok": False, "summary": f"host source not found: {src}", "data": {"src_path": str(src), "dest_path": str(dest)}}
+    if dest.exists() and not overwrite:
+        return {"ok": False, "summary": f"host destination already exists: {dest}", "data": {"src_path": str(src), "dest_path": str(dest)}}
+    parent = dest.parent
+    if not parent.exists():
+        if not create_parents:
+            return {"ok": False, "summary": f"host destination parent not found: {parent}", "data": {"src_path": str(src), "dest_path": str(dest)}}
+        parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists() and overwrite:
+        if dest.is_dir():
+            shutil.rmtree(dest)
+        else:
+            dest.unlink()
+    shutil.move(str(src), str(dest))
+    return {
+        "ok": True,
+        "summary": f"Moved host path: {src} -> {dest}",
+        "data": {
+            "src_path": str(src),
+            "dest_path": str(dest),
+            "transport": "manager_local_fallback",
+            "worker_error": str(remote_result),
+        },
+    }
+
+
+def delete_host_path(path: str, recursive: bool = False) -> dict[str, Any]:
+    remote_ok, remote_result = _try_host_worker_call(
+        "/files/delete",
+        {"path": path, "recursive": recursive},
+        timeout=30,
+    )
+    if remote_ok:
+        return remote_result if isinstance(remote_result, dict) else {"ok": False, "summary": str(remote_result), "data": {"transport": "host_worker"}}
+    target = _resolve_host_path(path)
+    if not target.exists():
+        return {"ok": False, "summary": f"host path not found: {target}", "data": {"path": str(target)}}
+    if target.is_dir():
+        if not recursive:
+            return {"ok": False, "summary": f"host directory requires recursive delete: {target}", "data": {"path": str(target)}}
+        shutil.rmtree(target)
+    else:
+        target.unlink()
+    return {
+        "ok": True,
+        "summary": f"Deleted host path: {target}",
+        "data": {
+            "path": str(target),
+            "recursive": bool(recursive),
+            "transport": "manager_local_fallback",
+            "worker_error": str(remote_result),
+        },
+    }
+
+
+def _validate_service_name(service: str) -> str:
+    name = str(service or "").strip()
+    if not name:
+        raise ValueError("service name is required")
+    if not re.fullmatch(r"[A-Za-z0-9_.@-]+", name):
+        raise ValueError(f"invalid service name: {name}")
+    return name
+
+
+def _validate_container_name(container: str) -> str:
+    name = str(container or "").strip()
+    if not name:
+        raise ValueError("container name is required")
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
+        raise ValueError(f"invalid container name: {name}")
+    return name
+
+
+def run_host_docker_ps(all_containers: bool = False, limit: int = 50, timeout: int = 20) -> dict[str, Any]:
+    remote_ok, remote_result = _try_host_worker_call(
+        "/ops/docker-ps",
+        {"all_containers": all_containers, "limit": limit, "timeout": timeout},
+        timeout=timeout,
+    )
+    if remote_ok:
+        return remote_result if isinstance(remote_result, dict) else {"ok": False, "summary": str(remote_result), "data": {"transport": "host_worker"}}
+    argv = ["docker", "ps"]
+    if all_containers:
+        argv.append("-a")
+    argv.extend(["--format", "{{json .}}"])
+    result = _run_host_operator_command(argv, timeout=timeout)
+    if not result.get("ok"):
+        return result
+    stdout = str(((result.get("data") or {}).get("stdout")) or "")
+    containers: list[dict[str, Any]] = []
+    for line in stdout.splitlines():
+        item = line.strip()
+        if not item:
+            continue
+        try:
+            containers.append(json.loads(item))
+        except json.JSONDecodeError:
+            containers.append({"raw": item})
+    use_limit = max(1, int(limit))
+    result["summary"] = f"Listed Docker containers on host ({min(len(containers), use_limit)} items)"
+    result["data"]["containers"] = containers[:use_limit]
+    result["data"]["all_containers"] = bool(all_containers)
+    result["data"]["limit"] = use_limit
+    result["data"]["transport"] = "manager_local_fallback"
+    result["data"]["worker_error"] = str(remote_result)
+    return result
+
+
+def run_host_service_status(service: str, lines: int = 40, timeout: int = 20) -> dict[str, Any]:
+    try:
+        safe_service = _validate_service_name(service)
+    except ValueError as exc:
+        return {"ok": False, "summary": str(exc), "data": {"service": service}}
+    remote_ok, remote_result = _try_host_worker_call(
+        "/ops/service-status",
+        {"service": safe_service, "lines": lines, "timeout": timeout},
+        timeout=timeout,
+    )
+    if remote_ok:
+        return remote_result if isinstance(remote_result, dict) else {"ok": False, "summary": str(remote_result), "data": {"transport": "host_worker"}}
+    use_lines = max(1, int(lines))
+    argv = ["systemctl", "status", safe_service, "--no-pager", f"--lines={use_lines}"]
+    result = _run_host_operator_command(argv, timeout=timeout)
+    if result.get("ok"):
+        result["summary"] = f"Read host service status: {safe_service}"
+        result["data"]["service"] = safe_service
+        result["data"]["lines"] = use_lines
+        result["data"]["transport"] = "manager_local_fallback"
+        result["data"]["worker_error"] = str(remote_result)
+    return result
+
+
+def run_host_service_logs(service: str, lines: int = 80, since: str = "", timeout: int = 20) -> dict[str, Any]:
+    try:
+        safe_service = _validate_service_name(service)
+    except ValueError as exc:
+        return {"ok": False, "summary": str(exc), "data": {"service": service}}
+    remote_ok, remote_result = _try_host_worker_call(
+        "/ops/service-logs",
+        {"service": safe_service, "lines": lines, "since": since, "timeout": timeout},
+        timeout=timeout,
+    )
+    if remote_ok:
+        return remote_result if isinstance(remote_result, dict) else {"ok": False, "summary": str(remote_result), "data": {"transport": "host_worker"}}
+    use_lines = max(1, int(lines))
+    argv = ["journalctl", "-u", safe_service, "--no-pager", "-n", str(use_lines)]
+    if str(since or "").strip():
+        argv.extend(["--since", str(since).strip()])
+    result = _run_host_operator_command(argv, timeout=timeout)
+    if result.get("ok"):
+        result["summary"] = f"Read host service logs: {safe_service}"
+        result["data"]["service"] = safe_service
+        result["data"]["lines"] = use_lines
+        result["data"]["since"] = str(since or "").strip()
+        result["data"]["transport"] = "manager_local_fallback"
+        result["data"]["worker_error"] = str(remote_result)
+    return result
+
+
+def run_host_docker_logs(container: str, lines: int = 80, timeout: int = 20) -> dict[str, Any]:
+    try:
+        safe_container = _validate_container_name(container)
+    except ValueError as exc:
+        return {"ok": False, "summary": str(exc), "data": {"container": container}}
+    remote_ok, remote_result = _try_host_worker_call(
+        "/ops/docker-logs",
+        {"container": safe_container, "lines": lines, "timeout": timeout},
+        timeout=timeout,
+    )
+    if remote_ok:
+        return remote_result if isinstance(remote_result, dict) else {"ok": False, "summary": str(remote_result), "data": {"transport": "host_worker"}}
+    use_lines = max(1, int(lines))
+    argv = ["docker", "logs", "--tail", str(use_lines), safe_container]
+    result = _run_host_operator_command(argv, timeout=timeout)
+    if result.get("ok"):
+        result["summary"] = f"Read host container logs: {safe_container}"
+        result["data"]["container"] = safe_container
+        result["data"]["lines"] = use_lines
+        result["data"]["transport"] = "manager_local_fallback"
+        result["data"]["worker_error"] = str(remote_result)
+    return result
+
+
+def run_host_docker_restart(container: str, timeout: int = 30) -> dict[str, Any]:
+    try:
+        safe_container = _validate_container_name(container)
+    except ValueError as exc:
+        return {"ok": False, "summary": str(exc), "data": {"container": container}}
+    remote_ok, remote_result = _try_host_worker_call(
+        "/ops/docker-restart",
+        {"container": safe_container, "timeout": timeout},
+        timeout=timeout,
+    )
+    if remote_ok:
+        return remote_result if isinstance(remote_result, dict) else {"ok": False, "summary": str(remote_result), "data": {"transport": "host_worker"}}
+    argv = ["docker", "restart", safe_container]
+    result = _run_host_operator_command(argv, timeout=timeout)
+    if result.get("ok"):
+        result["summary"] = f"Restarted Docker container on host: {safe_container}"
+        result["data"]["container"] = safe_container
+        result["data"]["transport"] = "manager_local_fallback"
+        result["data"]["worker_error"] = str(remote_result)
+    return result
+
+
+def run_host_service_restart(service: str, timeout: int = 30) -> dict[str, Any]:
+    try:
+        safe_service = _validate_service_name(service)
+    except ValueError as exc:
+        return {"ok": False, "summary": str(exc), "data": {"service": service}}
+    remote_ok, remote_result = _try_host_worker_call(
+        "/ops/service-restart",
+        {"service": safe_service, "timeout": timeout},
+        timeout=timeout,
+    )
+    if remote_ok:
+        return remote_result if isinstance(remote_result, dict) else {"ok": False, "summary": str(remote_result), "data": {"transport": "host_worker"}}
+    argv = ["systemctl", "restart", safe_service]
+    result = _run_host_operator_command(argv, timeout=timeout)
+    if result.get("ok"):
+        result["summary"] = f"Restarted host service: {safe_service}"
+        result["data"]["service"] = safe_service
+        result["data"]["transport"] = "manager_local_fallback"
+        result["data"]["worker_error"] = str(remote_result)
+    return result
+
+
+def run_host_container_recovery(container: str, logs_lines: int = 80, timeout: int = 45) -> dict[str, Any]:
+    before = run_host_docker_ps(all_containers=True, limit=200, timeout=timeout)
+    restart = run_host_docker_restart(container, timeout=timeout)
+    after = run_host_docker_ps(all_containers=True, limit=200, timeout=timeout)
+    logs = run_host_docker_logs(container, lines=logs_lines, timeout=timeout)
+    ok = bool(restart.get("ok")) and bool(after.get("ok"))
+    return {
+        "ok": ok,
+        "summary": f"Host container recovery {'completed' if ok else 'failed'}: {container}",
+        "data": {
+            "container": str(container or "").strip(),
+            "before": (before.get("data") or {}),
+            "restart": (restart.get("data") or {}),
+            "after": (after.get("data") or {}),
+            "logs": (logs.get("data") or {}),
+        },
+    }
+
+
+def run_host_service_recovery(service: str, status_lines: int = 30, logs_lines: int = 80, timeout: int = 45) -> dict[str, Any]:
+    before = run_host_service_status(service, lines=status_lines, timeout=timeout)
+    restart = run_host_service_restart(service, timeout=timeout)
+    after = run_host_service_status(service, lines=status_lines, timeout=timeout)
+    logs = run_host_service_logs(service, lines=logs_lines, timeout=timeout)
+    ok = bool(restart.get("ok")) and bool(after.get("ok"))
+    return {
+        "ok": ok,
+        "summary": f"Host service recovery {'completed' if ok else 'failed'}: {service}",
+        "data": {
+            "service": str(service or "").strip(),
+            "before": (before.get("data") or {}),
+            "restart": (restart.get("data") or {}),
+            "after": (after.get("data") or {}),
+            "logs": (logs.get("data") or {}),
+        },
+    }
+
+
+def run_host_process_list(limit: int = 200, query: str = "") -> dict[str, Any]:
+    encoded_query = quote(str(query or ""))
+    remote_ok, remote_result = _try_host_worker_call(
+        f"/processes?limit={max(1, int(limit))}&query={encoded_query}",
+        method="GET",
+        timeout=20,
+    )
+    if remote_ok:
+        return remote_result if isinstance(remote_result, dict) else {"ok": False, "summary": str(remote_result), "data": {"transport": "host_worker"}}
+    return {
+        "ok": False,
+        "summary": "Host process listing requires host worker",
+        "data": {"limit": max(1, int(limit)), "query": query, "transport": "manager_local_unavailable", "worker_error": str(remote_result)},
+    }
+
+
+def run_host_process_signal(pid: int, signal_name: str = "TERM") -> dict[str, Any]:
+    safe_signal = str(signal_name or "TERM").strip().upper()
+    remote_ok, remote_result = _try_host_worker_call(
+        "/processes/signal",
+        {"pid": int(pid), "signal_name": safe_signal},
+        timeout=20,
+    )
+    if remote_ok:
+        return remote_result if isinstance(remote_result, dict) else {"ok": False, "summary": str(remote_result), "data": {"transport": "host_worker"}}
+    if int(pid) <= 0:
+        return {"ok": False, "summary": f"invalid pid: {pid}", "data": {"pid": int(pid), "signal_name": safe_signal}}
+    signal_value = getattr(signal, f"SIG{safe_signal}", None)
+    if signal_value is None:
+        return {"ok": False, "summary": f"unsupported signal: {safe_signal}", "data": {"pid": int(pid), "signal_name": safe_signal}}
+    try:
+        os.kill(int(pid), signal_value)
+    except ProcessLookupError:
+        return {"ok": False, "summary": f"host process not found: pid={pid}", "data": {"pid": int(pid), "signal_name": safe_signal}}
+    except PermissionError:
+        return {"ok": False, "summary": f"permission denied signaling pid={pid}", "data": {"pid": int(pid), "signal_name": safe_signal}}
+    return {
+        "ok": True,
+        "summary": f"Signaled host process pid={pid} with {safe_signal}",
+        "data": {
+            "pid": int(pid),
+            "signal_name": safe_signal,
+            "transport": "manager_local_fallback",
+            "worker_error": str(remote_result),
+        },
+    }
+
+
+def run_host_process_recovery(pid: int, signal_name: str = "TERM", query: str = "") -> dict[str, Any]:
+    safe_query = str(query or "").strip() or str(int(pid))
+    before = run_host_process_list(limit=200, query=safe_query)
+    signal_result = run_host_process_signal(pid=int(pid), signal_name=signal_name)
+    after = run_host_process_list(limit=200, query=safe_query)
+    ok = bool(signal_result.get("ok"))
+    return {
+        "ok": ok,
+        "summary": f"Host process recovery {'completed' if ok else 'failed'}: pid={int(pid)}",
+        "data": {
+            "pid": int(pid),
+            "signal_name": str(signal_name or "TERM").strip().upper(),
+            "query": safe_query,
+            "before": (before.get("data") or {}),
+            "signal": (signal_result.get("data") or {}),
+            "after": (after.get("data") or {}),
+        },
+    }
 
 
 def queue_due_recurring_tasks() -> list[dict]:
@@ -3405,7 +5450,7 @@ def queue_due_recurring_tasks() -> list[dict]:
     queued: list[dict] = []
     for task in due:
         job_id = "auto_" + secrets.token_hex(5)
-        job = db.create_chat_session(job_id, title=f"Recurring: {task['name']}", permission_mode="auto_review")
+        job = db.create_chat_session(job_id, title=f"Recurring: {task['name']}", permission_mode="full_access")
         payload = task.get("payload") if isinstance(task.get("payload"), dict) else {}
         if not payload:
             payload = {"note": task.get("prompt", "")}
@@ -3568,6 +5613,153 @@ def host_browser_health():
         return {"ok": False, "bridge_url": bridge, "error": str(exc)}
 
 
+@app.get("/api/host-worker/health")
+def host_worker_health():
+    bridge = host_browser_bridge_url()
+    try:
+        data = host_browser_call("/health", method="GET")
+        return {"ok": True, "worker_url": bridge, "worker": data}
+    except Exception as exc:
+        return {"ok": False, "worker_url": bridge, "error": str(exc)}
+
+
+@app.post("/api/host-shell/run")
+def host_shell_run(payload: HostShellRunRequest):
+    result = run_host_shell_action(payload.command, cwd=payload.cwd, timeout=payload.timeout)
+    return {"ok": bool(result.get("ok")), **result}
+
+
+@app.post("/api/host-files/read")
+def host_files_read(payload: HostFileReadRequest):
+    result = read_host_file(payload.path, max_chars=payload.max_chars)
+    return {"ok": bool(result.get("ok")), **result}
+
+
+@app.post("/api/host-files/list")
+def host_files_list(payload: HostFileListRequest):
+    result = list_host_files(payload.path, limit=payload.limit)
+    return {"ok": bool(result.get("ok")), **result}
+
+
+@app.post("/api/host-files/write")
+def host_files_write(payload: HostFileWriteRequest):
+    result = write_host_file(
+        payload.path,
+        content=payload.content,
+        overwrite=payload.overwrite,
+        create_parents=payload.create_parents,
+    )
+    return {"ok": bool(result.get("ok")), **result}
+
+
+@app.post("/api/host-files/move")
+def host_files_move(payload: HostFileMoveRequest):
+    result = move_host_file(
+        payload.src_path,
+        payload.dest_path,
+        overwrite=payload.overwrite,
+        create_parents=payload.create_parents,
+    )
+    return {"ok": bool(result.get("ok")), **result}
+
+
+@app.post("/api/host-files/delete")
+def host_files_delete(payload: HostFileDeleteRequest):
+    result = delete_host_path(
+        payload.path,
+        recursive=payload.recursive,
+    )
+    return {"ok": bool(result.get("ok")), **result}
+
+
+@app.post("/api/host-worker/processes")
+def host_worker_processes(payload: HostProcessListRequest):
+    result = run_host_process_list(limit=payload.limit, query=payload.query)
+    return {"ok": bool(result.get("ok")), **result}
+
+
+@app.post("/api/host-worker/process-signal")
+def host_worker_process_signal(payload: HostProcessSignalRequest):
+    result = run_host_process_signal(pid=payload.pid, signal_name=payload.signal_name)
+    return {"ok": bool(result.get("ok")), **result}
+
+
+@app.post("/api/host-worker/process-recovery")
+def host_worker_process_recovery(payload: HostProcessRecoveryRequest):
+    result = run_host_process_recovery(pid=payload.pid, signal_name=payload.signal_name, query=payload.query)
+    return {"ok": bool(result.get("ok")), **result}
+
+
+@app.post("/api/host-ops/docker-ps")
+def host_ops_docker_ps(payload: HostDockerPsRequest):
+    result = run_host_docker_ps(
+        all_containers=payload.all_containers,
+        limit=payload.limit,
+        timeout=payload.timeout,
+    )
+    return {"ok": bool(result.get("ok")), **result}
+
+
+@app.post("/api/host-ops/service-status")
+def host_ops_service_status(payload: HostServiceStatusRequest):
+    result = run_host_service_status(
+        payload.service,
+        lines=payload.lines,
+        timeout=payload.timeout,
+    )
+    return {"ok": bool(result.get("ok")), **result}
+
+
+@app.post("/api/host-ops/service-logs")
+def host_ops_service_logs(payload: HostServiceLogsRequest):
+    result = run_host_service_logs(
+        payload.service,
+        lines=payload.lines,
+        since=payload.since,
+        timeout=payload.timeout,
+    )
+    return {"ok": bool(result.get("ok")), **result}
+
+
+@app.post("/api/host-ops/docker-restart")
+def host_ops_docker_restart(payload: HostDockerRestartRequest):
+    result = run_host_docker_restart(
+        payload.container,
+        timeout=payload.timeout,
+    )
+    return {"ok": bool(result.get("ok")), **result}
+
+
+@app.post("/api/host-ops/service-restart")
+def host_ops_service_restart(payload: HostServiceRestartRequest):
+    result = run_host_service_restart(
+        payload.service,
+        timeout=payload.timeout,
+    )
+    return {"ok": bool(result.get("ok")), **result}
+
+
+@app.post("/api/host-ops/container-recovery")
+def host_ops_container_recovery(payload: HostContainerRecoveryRequest):
+    result = run_host_container_recovery(
+        payload.container,
+        logs_lines=payload.logs_lines,
+        timeout=payload.timeout,
+    )
+    return {"ok": bool(result.get("ok")), **result}
+
+
+@app.post("/api/host-ops/service-recovery")
+def host_ops_service_recovery(payload: HostServiceRecoveryRequest):
+    result = run_host_service_recovery(
+        payload.service,
+        status_lines=payload.status_lines,
+        logs_lines=payload.logs_lines,
+        timeout=payload.timeout,
+    )
+    return {"ok": bool(result.get("ok")), **result}
+
+
 @app.get("/api/host-browser/browsers")
 def host_browser_browsers():
     try:
@@ -3607,8 +5799,7 @@ def host_browser_launch(payload: HostBrowserLaunchRequest):
 @app.post("/api/host-browser/facebook-research")
 def host_browser_facebook_research(payload: HostBrowserFacebookResearchRequest):
     try:
-        data = host_browser_call("/facebook-research", payload.model_dump(), timeout=240)
-        return {"ok": True, "bridge_url": host_browser_bridge_url(), **data}
+        return build_host_browser_facebook_research_result(payload)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc))
 
@@ -3642,12 +5833,31 @@ def host_browser_screenshot(payload: HostBrowserScreenshotRequest):
         raise HTTPException(status_code=502, detail=str(exc))
 
 
+@app.post("/api/host-browser/mouse-move")
+def host_browser_mouse_move(payload: HostBrowserMouseRequest):
+    try:
+        data = host_browser_call("/mouse-move", payload.model_dump())
+        return {"ok": True, "bridge_url": host_browser_bridge_url(), **data}
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
+@app.post("/api/host-browser/mouse-click")
+def host_browser_mouse_click(payload: HostBrowserMouseRequest):
+    try:
+        data = host_browser_call("/mouse-click", payload.model_dump())
+        return {"ok": True, "bridge_url": host_browser_bridge_url(), **data}
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
 @app.post("/api/host-browser/ocr-extract")
 def host_browser_ocr_extract(payload: HostBrowserOcrExtractRequest):
     system_prompt = (
         "Bạn là OCR/vision extractor cho Facebook research. "
-        "Chỉ đọc phần bài viết đang hiển thị trong ảnh. "
-        "Ưu tiên nội dung bài, bỏ phần UI nhiễu nếu có thể. "
+        "Chỉ đọc phần bài viết hoặc poster tuyển dụng đang hiển thị trong ảnh. "
+        "Ưu tiên headline, role, location, nội dung chính trong poster hoặc phần thân bài. "
+        "Bỏ phần UI nhiễu nếu có thể. "
         'Trả JSON thuần {"text":"...","confidence":"high|medium|low","reason":"...","needs_more_context":false}.'
     )
     user_prompt = (
@@ -3656,6 +5866,7 @@ def host_browser_ocr_extract(payload: HostBrowserOcrExtractRequest):
         f"- page title: {compact_text(payload.title, 200)}\n"
         f"- page url: {compact_text(payload.url, 300)}\n"
         f"- DOM excerpt hiện có (có thể thiếu): {compact_text(payload.excerpt, 500)}\n"
+        "Nếu đây là poster tuyển dụng, hãy ưu tiên đọc chính xác các cụm chữ lớn như job title, role, location, công nghệ.\n"
         "Nếu ảnh không đủ rõ, vẫn trả phần đọc được tốt nhất, không suy diễn."
     )
     result = cliproxy_vision(
@@ -4006,6 +6217,36 @@ def list_projects():
     return {"projects": db.list_projects()}
 
 
+@app.get("/api/projects/assistant-view")
+def list_project_assistant_view():
+    jobs: list[dict[str, Any]] = []
+    for item in db.list_jobs():
+        detail = db.get_job(str(item.get("id") or "")) or item
+        jobs.append(hydrate_job_for_ui(detail))
+    entries = [build_project_assistant_entry(project, jobs) for project in db.list_projects(include_inactive=False)]
+    entries.sort(
+        key=lambda item: (
+            int(item.get("urgent_jobs_count") or 0),
+            int(item.get("top_attention_score") or 0),
+            str(((item.get("project") or {}).get("updated_at")) or ""),
+        ),
+        reverse=True,
+    )
+    return {"projects": entries}
+
+
+@app.get("/api/projects/{project_id}/assistant-view")
+def get_project_assistant_view(project_id: int):
+    project = next((item for item in db.list_projects() if int(item.get("id") or 0) == project_id), None)
+    if not project:
+        raise HTTPException(status_code=404, detail="project not found")
+    jobs: list[dict[str, Any]] = []
+    for item in db.list_jobs():
+        detail = db.get_job(str(item.get("id") or "")) or item
+        jobs.append(hydrate_job_for_ui(detail))
+    return build_project_assistant_entry(project, jobs)
+
+
 @app.post("/api/projects")
 def create_project(payload: ProjectRequest):
     return {"project": db.create_project(payload.name, payload.root_path, payload.summary, payload.memory, payload.status)}
@@ -4092,6 +6333,19 @@ def tools_health():
     return {"ok": True, "tools": checks}
 
 
+@app.get("/api/cliproxy/models")
+def cliproxy_models():
+    base_url = os.getenv("CLIPROXY_BASE_URL", "http://host.docker.internal:8317").rstrip("/")
+    api_key = os.getenv("CLIPROXY_API_KEY", "").strip()
+    if not api_key:
+        raise HTTPException(status_code=500, detail="CLIPROXY_API_KEY is not configured")
+    try:
+        data = http_json("GET", f"{base_url}/v1/models", token=api_key, timeout=20)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"CLIProxy models lookup failed: {exc}") from exc
+    return data
+
+
 @app.get("/api/claude/skill-index")
 def claude_skill_index():
     return scan_claude_skill_index()
@@ -4168,11 +6422,26 @@ def list_jobs():
     return {"jobs": db.list_jobs()}
 
 
+@app.get("/api/inbox")
+def get_inbox():
+    entries: list[dict[str, Any]] = []
+    for job in db.list_jobs():
+        detail = db.get_job(str(job.get("id") or "")) or job
+        entries.append(build_inbox_entry(detail))
+    entries.sort(
+        key=lambda item: (
+            int(item.get("attention_score") or 0),
+            str(item.get("updated_at") or ""),
+        ),
+        reverse=True,
+    )
+    return {"inbox": entries[:50]}
+
+
 @app.get("/api/chat")
 def get_main_chat():
     job = db.get_or_create_chat()
-    detail = db.get_job(job["id"])
-    return {"job": detail or job}
+    return job_response(job, fallback=job)
 
 
 @app.post("/api/chat/messages")
@@ -4205,7 +6474,7 @@ def create_chat_session(payload: ChatSessionRequest | None = None):
     permission_mode = validate_permission_mode(payload.permission_mode if payload else "full_access")
     job = db.create_chat_session(job_id, permission_mode=permission_mode)
     refresh_session_memory(job["id"])
-    return {"job": db.get_job(job["id"]) or job}
+    return job_response(job, fallback=job)
 
 
 @app.post("/api/jobs/{job_id}/plan-from-chat")
@@ -4224,7 +6493,7 @@ def plan_from_chat(job_id: str, payload: MessageRequest):
         db.replace_plan(job_id, [], render_questions(decision["questions"]), request=planning_request)
         db.update_job_status(job_id, "needs_input")
         refresh_session_memory(job_id)
-        return {"job": db.get_job(job_id)}
+        return job_response(job_id)
     db.replace_plan(
         job_id,
         decision["plan"],
@@ -4232,7 +6501,7 @@ def plan_from_chat(job_id: str, payload: MessageRequest):
         request=planning_request,
     )
     refresh_session_memory(job_id)
-    return {"job": db.get_job(job_id)}
+    return job_response(job_id)
 
 
 @app.put("/api/jobs/{job_id}/plan")
@@ -4250,7 +6519,7 @@ def edit_plan(job_id: str, payload: PlanEditRequest):
     if payload.comment.strip():
         db.add_message(job_id, "user", f"[Plan edit note] {payload.comment.strip()}")
     refresh_session_memory(job_id)
-    return {"job": db.get_job(job_id)}
+    return job_response(job_id)
 
 
 @app.post("/api/jobs/{job_id}/reconfirm-plan")
@@ -4275,7 +6544,7 @@ def reconfirm_plan(job_id: str, payload: MessageRequest):
         db.replace_plan(job_id, job.get("plan", []), render_questions(decision["questions"]), request=job.get("request"))
         db.update_job_status(job_id, "needs_input")
         refresh_session_memory(job_id)
-        return {"job": db.get_job(job_id)}
+        return job_response(job_id)
 
     db.replace_plan(
         job_id,
@@ -4284,7 +6553,7 @@ def reconfirm_plan(job_id: str, payload: MessageRequest):
         request=job.get("request"),
     )
     refresh_session_memory(job_id)
-    return {"job": db.get_job(job_id)}
+    return job_response(job_id)
 
 
 @app.post("/api/jobs/{job_id}/code")
@@ -4301,12 +6570,12 @@ def create_job(payload: CreateJobRequest):
         initial_reply = model_chat_reply([{"role": "user", "content": payload.request}], payload.request)
         job = db.create_job(job_id, title, payload.request, [], status="chat", permission_mode=permission_mode, manager_message=initial_reply)
         refresh_session_memory(job_id)
-        return {"job": db.get_job(job_id) or job}
+        return job_response(job, fallback=job)
     graph = build_graph()
     state = graph.invoke({"request": payload.request})
     job = db.create_job(job_id, title, payload.request, state.get("plan", []), permission_mode=permission_mode)
     refresh_session_memory(job_id)
-    return {"job": db.get_job(job_id) or job}
+    return job_response(job, fallback=job)
 
 
 @app.get("/api/jobs/{job_id}")
@@ -4337,7 +6606,7 @@ def update_session_memory(job_id: str, payload: SessionMemoryRequest):
         payload.decisions,
         payload.last_result,
     )
-    return {"session_memory": memory, "job": db.get_job(job_id)}
+    return {"session_memory": memory, **job_response(job_id)}
 
 
 @app.post("/api/jobs/{job_id}/focus-file")
@@ -4349,7 +6618,7 @@ def add_focus_file(job_id: str, payload: FocusFileRequest):
     db.add_focus_file(job_id, payload.name[:240], content)
     db.add_message(job_id, "langgraph", f"Đã thêm file focus: {payload.name}. Runtime sẽ ưu tiên nội dung file này khi lập plan/chạy.")
     refresh_session_memory(job_id)
-    return {"job": db.get_job(job_id)}
+    return job_response(job_id)
 
 
 @app.delete("/api/jobs/{job_id}")
@@ -4367,7 +6636,7 @@ def rename_job(job_id: str, payload: RenameJobRequest):
         raise HTTPException(status_code=422, detail="title required")
     if not db.update_job_title(job_id, title):
         raise HTTPException(status_code=404, detail="job not found")
-    return {"job": db.get_job(job_id)}
+    return job_response(job_id)
 
 
 @app.patch("/api/jobs/{job_id}/permission-mode")
@@ -4375,7 +6644,7 @@ def update_permission_mode(job_id: str, payload: PermissionModeRequest):
     mode = validate_permission_mode(payload.permission_mode)
     if not db.update_permission_mode(job_id, mode):
         raise HTTPException(status_code=404, detail="job not found")
-    return {"job": db.get_job(job_id)}
+    return job_response(job_id)
 
 
 @app.post("/api/jobs/{job_id}/messages")
@@ -4388,7 +6657,7 @@ def add_message(job_id: str, payload: MessageRequest):
         db.update_job_status(job_id, "chat")
         job = db.get_job(job_id) or job
     if is_duplicate_user_message(job, payload.content):
-        return {"job": job}
+        return job_response(job, fallback=job)
     if job["status"] == "chat":
         return {"job": handle_agent_message(job_id, payload.content)}
     if job["status"] == "needs_input":
@@ -4397,7 +6666,7 @@ def add_message(job_id: str, payload: MessageRequest):
         raise HTTPException(status_code=409, detail=f"cannot discuss from {job['status']}")
     db.add_message(job_id, "user", payload.content)
     db.add_message(job_id, "langgraph", "Đã ghi nhận. Bạn có thể regenerate plan hoặc approve plan hiện tại.")
-    return {"job": db.get_job(job_id)}
+    return job_response(job_id)
 
 
 @app.post("/api/actions/{action_id}/approve")
@@ -4413,7 +6682,7 @@ def approve_action(action_id: int):
         raise HTTPException(status_code=409, detail=f"action already {latest.get('status', 'updated')}")
     start_action_background(action_id)
     trace_event("action_approved", action_id=action_id, job_id=action.get("job_id"), kind=action.get("kind"))
-    return {"job": db.get_job(action["job_id"])}
+    return job_response(action["job_id"], fallback=job)
 
 
 @app.post("/api/actions/{action_id}/reject")
@@ -4427,7 +6696,7 @@ def reject_action(action_id: int):
     db.add_message(action["job_id"], "langgraph", f"Đã reject action #{action_id}: {action['title']}")
     trace_event("action_rejected", action_id=action_id, job_id=action.get("job_id"), kind=action.get("kind"))
     refresh_session_memory(action["job_id"])
-    return {"job": db.get_job(action["job_id"])}
+    return job_response(action["job_id"])
 
 
 @app.post("/api/jobs/{job_id}/messages/stream")
@@ -4485,10 +6754,10 @@ def regenerate_plan(job_id: str):
         db.replace_plan(job_id, [], render_questions(decision["questions"]), request=planning_request)
         db.update_job_status(job_id, "needs_input")
         refresh_session_memory(job_id)
-        return {"job": db.get_job(job_id)}
+        return job_response(job_id)
     db.replace_plan(job_id, decision["plan"], "Đã regenerate plan cụ thể từ discussion mới.", request=planning_request)
     refresh_session_memory(job_id)
-    return {"job": db.get_job(job_id)}
+    return job_response(job_id)
 
 
 @app.post("/api/jobs/{job_id}/approve")
@@ -4500,7 +6769,7 @@ def approve(job_id: str):
         raise HTTPException(status_code=409, detail=f"cannot approve from {job['status']}")
     db.approve_job(job_id)
     refresh_session_memory(job_id)
-    return {"job": db.get_job(job_id)}
+    return job_response(job_id)
 
 
 @app.post("/api/jobs/{job_id}/reopen-plan")
@@ -4514,7 +6783,7 @@ def reopen_plan(job_id: str):
     db.update_job_status(job_id, "chat", result="", error="")
     db.add_message(job_id, "langgraph", "Đã hủy plan hiện tại và quay về chat bình thường.")
     refresh_session_memory(job_id)
-    return {"job": db.get_job(job_id)}
+    return job_response(job_id)
 
 
 @app.post("/api/jobs/{job_id}/run")
@@ -4541,7 +6810,7 @@ def run_job(job_id: str):
             execution_request,
             discussion,
             step_callback,
-            job.get("permission_mode", "auto_review"),
+            job.get("permission_mode", "full_access"),
             [
                 {"name": str(item.get("name", "")), "content": str(item.get("content", ""))}
                 for item in job.get("focus_files", [])
@@ -4550,33 +6819,52 @@ def run_job(job_id: str):
         result = state.get("result", "LangGraph native backend finished without a report.")
         chat_result = sanitize_manager_content(str(result), "Job đã chạy xong nhưng report trả về dữ liệu kỹ thuật. Chi tiết nằm trong Result/Logs.")
         verification = state.get("verification", {})
+        db.upsert_job_verification(job_id, verification)
+        verify_ok = bool(verification.get("ok"))
+        stored_result = maybe_store_job_result_artifact(job_id, str(result), is_error=not verify_ok)
         if verification.get("ok"):
             db.update_step(job_id, "report", "done", "Result saved; verify OK")
-            db.update_job_status(job_id, "done", result=result)
+            db.update_job_status(job_id, "done", result=stored_result)
             db.add_message(job_id, "langgraph", chat_result)
-            trace_event("job_run_finish", job_id=job_id, ok=True, elapsed_ms=round((time.perf_counter() - started) * 1000, 2))
+            trace_event(
+                "job_run_finish",
+                job_id=job_id,
+                ok=True,
+                elapsed_ms=round((time.perf_counter() - started) * 1000, 2),
+                artifact=stored_result.lstrip().startswith("{") and '"artifact": true' in stored_result.lower(),
+            )
         else:
+            tool_failure_details = verification.get("tool_failure_details") if isinstance(verification.get("tool_failure_details"), list) else []
+            detail = ", ".join(str(item) for item in tool_failure_details[:6])
             error = "Native runtime finished but verification did not pass"
+            if detail:
+                error += f" [{detail}]"
             db.update_step(job_id, "report", "failed", error)
-            db.update_job_status(job_id, "failed", result=result, error=error)
+            db.update_job_status(job_id, "failed", result=stored_result, error=error)
             db.add_message(job_id, "langgraph", chat_result)
+            queue_verification_follow_up(job_id, verification)
             trace_event(
                 "job_run_finish",
                 job_id=job_id,
                 ok=False,
                 elapsed_ms=round((time.perf_counter() - started) * 1000, 2),
                 error=error,
+                error_class="verification_failed",
+                artifact=stored_result.lstrip().startswith("{") and '"artifact": true' in stored_result.lower(),
             )
     except Exception as exc:
+        error_text = str(exc)
         db.update_step(job_id, "run_error", "failed", str(exc))
-        db.update_job_status(job_id, "failed", error=str(exc))
+        db.update_job_status(job_id, "failed", error=error_text)
+        db.upsert_job_verification(job_id, {"ok": False, "error_class": detect_error_class(error_text), "exception": compact_text(error_text, 600)})
         db.add_message(job_id, "langgraph", sanitize_manager_content(f"Job lỗi: {exc}", "Job lỗi khi chạy. Chi tiết kỹ thuật nằm trong Logs."))
         trace_event(
             "job_run_finish",
             job_id=job_id,
             ok=False,
             elapsed_ms=round((time.perf_counter() - started) * 1000, 2),
-            error=compact_text(str(exc), 600),
+            error=compact_text(error_text, 600),
+            error_class=detect_error_class(error_text),
         )
     refresh_session_memory(job_id)
-    return {"job": db.get_job(job_id)}
+    return {"job": hydrate_job_for_ui(db.get_job(job_id) or {})}

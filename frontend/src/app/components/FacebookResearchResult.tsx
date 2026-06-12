@@ -28,8 +28,9 @@ function isUsableFacebookPostUrl(value: string): boolean {
   const url = String(value || '').trim();
   if (!url) return false;
   if (url.includes('/search/posts/')) return false;
-  if (url.includes('__cft__') || url.includes('__tn__=')) return false;
-  return true;
+  if (/\/permalink\//i.test(url) || /\/posts\//i.test(url) || /story_fbid=/i.test(url) || /permalink\.php/i.test(url)) return true;
+  if (/\/photo\/\?/i.test(url) || /[?&]fbid=/i.test(url)) return true;
+  return false;
 }
 
 function timeStatusLabel(value: string): string {

@@ -1,0 +1,15 @@
+[Unit]
+Description=LangGraph Host Worker
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/giang/Work/AgentStack/LangGraph_Manager/LangGraph_Manager
+ExecStart=/usr/bin/env node /home/giang/Work/AgentStack/LangGraph_Manager/LangGraph_Manager/tools/host_browser_bridge.mjs
+Restart=always
+RestartSec=2
+Environment=HOST_BROWSER_BRIDGE_PORT=3342
+Environment=HOST_BROWSER_BRIDGE_HOST=0.0.0.0
+
+[Install]
+WantedBy=default.target

@@ -11,10 +11,10 @@ as a full knowledge dump. Read deeper docs only when the task needs them.
 - Purpose: manage chat sessions, actions, logs, memory, file attachments, and
   delegate code/workspace tasks to Claude executor.
 - Runtime: Docker service `langgraph-manager` on port `8899`.
-- Workspace in container: `/workspace/LangGraph_Manager`.
-- Host repo path: `D:/User/File/LangGraph_Manager`.
+- Workspace in container: `/workspace/LangGraph_Manager/LangGraph_Manager`.
+- Host repo path: `/home/giang/Work/AgentStack/LangGraph_Manager/LangGraph_Manager`.
 - State DB/artifacts: `data/` on host, `/data/state` in container.
-- Claude home/config: `D:/User/File/ClaudeHome`.
+- Claude home/config: `/home/giang/Work/AgentStack/ClaudeHome/ClaudeHome`.
 
 ## Read When Needed
 
@@ -113,14 +113,14 @@ guards:
 
 ## Preferred Commands
 
-Use PowerShell on the host and POSIX shell inside containers.
+Use POSIX shell on the host and inside containers.
 
-- Health: `Invoke-RestMethod http://127.0.0.1:8899/api/health`
-- Tool health: `Invoke-RestMethod http://127.0.0.1:8899/api/tools/health`
+- Health: `curl http://127.0.0.1:8899/api/health`
+- Tool health: `curl http://127.0.0.1:8899/api/tools/health`
 - Restart service: `docker compose up -d --no-build --force-recreate langgraph-manager`
 - Rebuild Claude MCP executor: `docker build -f Dockerfile.claude-executor-mcp -t claude-executor-mcp:local .`
-- App tests: `docker run --rm -v D:/User/File/LangGraph_Manager:/app -w /app langgraph_manager-langgraph-manager python -m pytest tests -q`
-- JS check: `node --check src\langgraph_manager\static\app.js`
+- App tests: `docker run --rm -v /home/giang/Work/AgentStack/LangGraph_Manager/LangGraph_Manager:/app -w /app langgraph_manager-langgraph-manager python -m pytest tests -q`
+- JS check: `node --check src/langgraph_manager/static/app.js`
 
 ## Completion Standard
 

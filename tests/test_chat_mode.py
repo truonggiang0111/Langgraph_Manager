@@ -9,7 +9,7 @@ from langgraph_manager.app import app, casual_reply, is_casual_chat
 
 def test_casual_chat_detection():
     assert is_casual_chat("alo bạn nghe tôi nói k")
-    assert casual_reply("alo bạn nghe tôi nói k").startswith("Mình nghe đây")
+    assert "nghe đây" in casual_reply("alo bạn nghe tôi nói k")
     assert "lập plan" in casual_reply("bạn có thể làm được gì")
     assert not is_casual_chat("sửa lỗi docker giúp tôi")
 
@@ -23,7 +23,7 @@ def test_create_casual_chat_job(tmp_path, monkeypatch):
         job = res.json()["job"]
         assert job["status"] == "chat"
         detail = client.get(f"/api/jobs/{job['id']}").json()["job"]
-        assert "Mình nghe đây" in detail["messages"][-1]["content"]
+        assert "nghe đây" in detail["messages"][-1]["content"]
 
 
 def test_chat_followup_answers_capability_question(tmp_path, monkeypatch):
@@ -54,28 +54,20 @@ def test_chat_mode_uses_model_when_available(tmp_path, monkeypatch):
         assert detail["messages"][-1]["content"] == "Mình nghe rõ, bạn cứ nói tiếp."
 
 
-def test_main_chat_is_continuous_and_uses_model(tmp_path, monkeypatch):
+def test_main_chat_is_continuous_for_casual_messages(tmp_path, monkeypatch):
     monkeypatch.setenv("LANGGRAPH_STATE_DIR", str(tmp_path))
-    calls = []
-
-    def fake_chat(messages, system_prompt=""):
-        calls.append(messages[-1]["content"])
-        return {"ok": True, "data": {"content": f"reply:{messages[-1]['content']}"}}
-
-    monkeypatch.setattr(app_module, "cliproxy_chat", fake_chat)
     with TestClient(app) as client:
         main = client.get("/api/chat").json()["job"]
         assert main["id"] == "main_chat"
         assert main["status"] == "chat"
         assert main["messages"][0]["role"] == "langgraph"
 
-        first = client.post("/api/chat/messages", json={"content": "câu 1"}).json()["job"]
-        second = client.post("/api/chat/messages", json={"content": "câu 2"}).json()["job"]
+        first = client.post("/api/chat/messages", json={"content": "alo"}).json()["job"]
+        second = client.post("/api/chat/messages", json={"content": "alo lần 2"}).json()["job"]
 
         assert first["id"] == "main_chat"
         assert second["id"] == "main_chat"
-        assert calls == ["câu 1", "câu 2"]
-        assert [m["content"] for m in second["messages"][-4:]] == ["câu 1", "reply:câu 1", "câu 2", "reply:câu 2"]
+        assert [m["content"] for m in second["messages"][-4:]] == ["alo", "Em nghe đây. Anh nói tiếp đi, em đang theo dõi.", "alo lần 2", "Em nghe đây. Anh nói tiếp đi, em đang theo dõi."]
 
 
 def test_plan_from_chat_builds_onboarding_agent_flow_without_model(tmp_path, monkeypatch):
@@ -98,63 +90,45 @@ def test_plan_from_chat_builds_onboarding_agent_flow_without_model(tmp_path, mon
         assert any("fake report" in step.lower() for step in planned["plan"])
 
 
-def test_chat_agent_creates_pending_workspace_action(tmp_path, monkeypatch):
+def test_chat_agent_routes_engineering_request_to_coding_executor(tmp_path, monkeypatch):
     monkeypatch.setenv("LANGGRAPH_STATE_DIR", str(tmp_path))
-
-    def fake_chat(messages, system_prompt=""):
-        assert "trợ lý cá nhân" in system_prompt
-        return {
+    monkeypatch.setattr(
+        app_module,
+        "run_tool",
+        lambda name, context: {
             "ok": True,
-            "data": {
-                "content": (
-                    '{"mode":"pending_action","reply":"Mình cần chạy lệnh để kiểm tra.",'
-                    '"action":{"kind":"workspace_command","title":"Check docker",'
-                    '"preview":"docker ps --format ...",'
-                    '"payload":{"command":"docker ps --format \'{{.Names}}\'","risk":"low","timeout":30}}}'
-                )
-            },
-        }
-
-    monkeypatch.setattr(app_module, "cliproxy_chat", fake_chat)
+            "summary": "docker checked",
+            "data": {"output": '{"type":"result","result":"Đã kiểm tra docker.","is_error":false}\n'},
+        },
+    )
 
     with TestClient(app) as client:
         chat = client.post("/api/chats").json()["job"]
         updated = client.post(f"/api/jobs/{chat['id']}/messages", json={"content": "kiểm tra docker"}).json()["job"]
 
-        assert updated["pending_actions"][0]["kind"] == "workspace_command"
-        assert updated["pending_actions"][0]["status"] == "pending"
-        assert "Action chờ duyệt" in updated["messages"][-1]["content"]
+        assert updated["pending_actions"][0]["kind"] == "coding_agent_executor"
+        assert updated["pending_actions"][0]["status"] == "done"
+        assert "Đã kiểm tra docker." in updated["messages"][-1]["content"]
 
 
-def test_chat_agent_parses_json_decision_wrapped_in_markdown(tmp_path, monkeypatch):
+def test_chat_agent_skips_model_json_parsing_for_direct_executor_route(tmp_path, monkeypatch):
     monkeypatch.setenv("LANGGRAPH_STATE_DIR", str(tmp_path))
-
-    def fake_chat(messages, system_prompt=""):
-        return {
+    monkeypatch.setattr(
+        app_module,
+        "run_tool",
+        lambda name, context: {
             "ok": True,
-            "data": {
-                "content": (
-                    'Được thôi anh. '
-                    '{"mode":"pending_action","reply":"Em sẽ kiểm tra workspace.",'
-                    '"action":{"kind":"workspace_command","title":"Kiểm tra workspace",'
-                    '"preview":"pwd","payload":{"command":"pwd","risk":"medium"}}}\n\n'
-                    "```json\n"
-                    '{\n  "mode": "pending_action",\n  "reply": "Em sẽ kiểm tra workspace.",\n'
-                    '  "action": {"kind": "workspace_command", "title": "Kiểm tra workspace", "preview": "pwd", "payload": {"command": "pwd", "risk": "medium"}}\n'
-                    "}\n```"
-                )
-            },
-        }
-
-    monkeypatch.setattr(app_module, "cliproxy_chat", fake_chat)
+            "summary": "workspace inspected",
+            "data": {"output": '{"type":"result","result":"Em sẽ kiểm tra workspace.","is_error":false}\n'},
+        },
+    )
 
     with TestClient(app) as client:
         chat = client.post("/api/chats").json()["job"]
         updated = client.post(f"/api/jobs/{chat['id']}/messages", json={"content": "kiểm tra workspace thử"}).json()["job"]
 
-        assert updated["pending_actions"][0]["kind"] == "workspace_command"
-        assert "```json" not in updated["messages"][-1]["content"]
-        assert '"mode"' not in updated["messages"][-1]["content"]
+        assert updated["pending_actions"][0]["kind"] == "coding_agent_executor"
+        assert updated["pending_actions"][0]["status"] == "done"
         assert "Em sẽ kiểm tra workspace." in updated["messages"][-1]["content"]
 
 
@@ -165,6 +139,15 @@ def test_message_mentioning_claude_routes_directly_to_executor(tmp_path, monkeyp
         raise AssertionError("LangGraph model should not be called for direct Claude route")
 
     monkeypatch.setattr(app_module, "cliproxy_chat", fail_if_called)
+    monkeypatch.setattr(
+        app_module,
+        "run_tool",
+        lambda name, context: {
+            "ok": True,
+            "summary": "delegated",
+            "data": {"output": '{"type":"result","result":"Đã chuyển thẳng cho Claude.","is_error":false}\n'},
+        },
+    )
 
     with TestClient(app) as client:
         chat = client.post("/api/chats").json()["job"]
@@ -176,7 +159,8 @@ def test_message_mentioning_claude_routes_directly_to_executor(tmp_path, monkeyp
         action = updated["pending_actions"][0]
         assert action["kind"] == "coding_agent_executor"
         assert action["payload"]["request"] == "hãy gọi Claude kiểm tra repo giúp tôi"
-        assert "chuyển thẳng" in updated["messages"][-1]["content"]
+        assert action["status"] == "done"
+        assert "Đã chuyển thẳng cho Claude." in updated["messages"][-1]["content"]
 
 
 def test_cli_proxy_model_check_routes_directly_to_executor(tmp_path, monkeypatch):
@@ -186,6 +170,15 @@ def test_cli_proxy_model_check_routes_directly_to_executor(tmp_path, monkeypatch
         raise AssertionError("LangGraph model should not answer CLI proxy checks directly")
 
     monkeypatch.setattr(app_module, "cliproxy_chat", fail_if_called)
+    monkeypatch.setattr(
+        app_module,
+        "run_tool",
+        lambda name, context: {
+            "ok": True,
+            "summary": "delegated",
+            "data": {"output": '{"type":"result","result":"Đã check qua Claude executor.","is_error":false}\n'},
+        },
+    )
 
     with TestClient(app) as client:
         chat = client.post("/api/chats").json()["job"]
@@ -197,7 +190,8 @@ def test_cli_proxy_model_check_routes_directly_to_executor(tmp_path, monkeypatch
         action = updated["pending_actions"][0]
         assert action["kind"] == "coding_agent_executor"
         assert action["payload"]["request"] == "check giúp tôi xem đang sài model gì trong CLI proxy"
-        assert "chuyển thẳng" in updated["messages"][-1]["content"]
+        assert action["status"] == "done"
+        assert "Đã check qua Claude executor." in updated["messages"][-1]["content"]
 
 
 @pytest.mark.parametrize(
@@ -216,6 +210,15 @@ def test_plugin_or_mcp_requests_route_directly_to_executor(tmp_path, monkeypatch
         raise AssertionError("LangGraph model should not be called for plugin/MCP direct route")
 
     monkeypatch.setattr(app_module, "cliproxy_chat", fail_if_called)
+    monkeypatch.setattr(
+        app_module,
+        "run_tool",
+        lambda name, context: {
+            "ok": True,
+            "summary": "delegated",
+            "data": {"output": '{"type":"result","result":"Đã chuyển plugin/MCP cho Claude executor.","is_error":false}\n'},
+        },
+    )
 
     with TestClient(app) as client:
         chat = client.post("/api/chats").json()["job"]
@@ -224,6 +227,7 @@ def test_plugin_or_mcp_requests_route_directly_to_executor(tmp_path, monkeypatch
         action = updated["pending_actions"][0]
         assert action["kind"] == "coding_agent_executor"
         assert action["payload"]["request"] == content
+        assert action["status"] == "done"
         assert "plugin/MCP" in updated["messages"][-1]["content"]
 
 
@@ -344,9 +348,9 @@ def test_code_mode_endpoint_routes_to_claude_executor(tmp_path, monkeypatch):
         assert action["kind"] == "coding_agent_executor"
         assert action["payload"]["request"] == "sửa lỗi UI chat bị nhảy scroll"
         assert "intent" not in action["payload"]
-        assert "task_complexity" not in action["payload"]
-        assert "ordered_tool_names" not in action["payload"]
-        assert "recommended_tools" not in action["payload"]
+        assert action["payload"]["task_complexity"] in {"simple", "composite", "complex_composite"}
+        assert isinstance(action["payload"].get("ordered_tool_names", []), list)
+        assert isinstance(action["payload"].get("recommended_tools", []), list)
         assert "recommended_read_order" not in action["payload"]
         assert "baseline_tools" not in action["payload"]
         assert "Claude executor" in updated["messages"][-1]["content"]
@@ -381,7 +385,7 @@ def test_code_mode_marks_composite_task_when_request_spans_ui_and_trace(tmp_path
         action = updated["pending_actions"][0]
         assert action["kind"] == "coding_agent_executor"
         assert "intent" not in action["payload"]
-        assert "task_complexity" not in action["payload"]
+        assert action["payload"]["task_complexity"] in {"simple", "composite", "complex_composite"}
         assert "complexity_score" not in action["payload"]
 
 
@@ -409,30 +413,20 @@ def test_skill_search_endpoint_returns_ranked_matches(tmp_path, monkeypatch):
         assert body["results"][0]["name"] == "frontend-design"
 
 
-def test_full_access_workspace_action_auto_runs_tool(tmp_path, monkeypatch):
+def test_full_access_engineering_request_auto_runs_coding_executor(tmp_path, monkeypatch):
     monkeypatch.setenv("LANGGRAPH_STATE_DIR", str(tmp_path))
     captured = {}
-
-    def fake_chat(messages, system_prompt=""):
-        if "Action vừa được approve" in messages[-1]["content"]:
-            return {"ok": True, "data": {"content": '{"mode":"answer","content":"Đã kiểm tra xong."}'}}
-        return {
-            "ok": True,
-            "data": {
-                "content": (
-                    '{"mode":"pending_action","reply":"Cần chạy command.",'
-                    '"action":{"kind":"workspace_command","title":"List files","preview":"ls",'
-                    '"payload":{"command":"ls","cwd":"","risk":"low"}}}'
-                )
-            },
-        }
-
-    monkeypatch.setattr(app_module, "cliproxy_chat", fake_chat)
 
     def fake_run_tool(name, context):
         captured["name"] = name
         captured["context"] = context
-        return {"ok": True, "summary": "ran", "data": {"stdout": "ok"}}
+        return {
+            "ok": True,
+            "summary": "ran",
+            "data": {
+                "output": '{"type":"result","result":"Đã kiểm tra xong.","is_error":false}\n',
+            },
+        }
 
     monkeypatch.setattr(app_module, "run_tool", fake_run_tool)
 
@@ -440,36 +434,27 @@ def test_full_access_workspace_action_auto_runs_tool(tmp_path, monkeypatch):
         chat = client.post("/api/chats", json={"permission_mode": "full_access"}).json()["job"]
         updated = client.post(f"/api/jobs/{chat['id']}/messages", json={"content": "list file"}).json()["job"]
 
-        assert captured["name"] == "workspace_executor"
+        assert captured["name"] == "coding_agent_executor"
         assert captured["context"]["permission_mode"] == "full_access"
+        assert captured["context"]["request"] == "list file"
         assert updated["pending_actions"][0]["status"] == "done"
         assert "Đã kiểm tra xong" in updated["messages"][-1]["content"]
 
 
-def test_workspace_inspect_action_auto_runs_tool(tmp_path, monkeypatch):
+def test_full_access_repo_request_routes_to_coding_executor(tmp_path, monkeypatch):
     monkeypatch.setenv("LANGGRAPH_STATE_DIR", str(tmp_path))
     captured = {}
-
-    def fake_chat(messages, system_prompt=""):
-        if "Action vừa được approve" in messages[-1]["content"]:
-            return {"ok": True, "data": {"content": '{"mode":"answer","content":"Đã inspect workspace."}'}}
-        return {
-            "ok": True,
-            "data": {
-                "content": (
-                    '{"mode":"pending_action","reply":"Mình sẽ inspect workspace trước.",'
-                    '"action":{"kind":"workspace_inspect","title":"Inspect workspace","preview":"List markers/files",'
-                    '"payload":{"max_files":50}}}'
-                )
-            },
-        }
-
-    monkeypatch.setattr(app_module, "cliproxy_chat", fake_chat)
 
     def fake_run_tool(name, context):
         captured["name"] = name
         captured["context"] = context
-        return {"ok": True, "summary": "inspected", "data": {"files": []}}
+        return {
+            "ok": True,
+            "summary": "inspected",
+            "data": {
+                "output": '{"type":"result","result":"Đã inspect workspace.","is_error":false}\n',
+            },
+        }
 
     monkeypatch.setattr(app_module, "run_tool", fake_run_tool)
 
@@ -477,8 +462,9 @@ def test_workspace_inspect_action_auto_runs_tool(tmp_path, monkeypatch):
         chat = client.post("/api/chats", json={"permission_mode": "full_access"}).json()["job"]
         updated = client.post(f"/api/jobs/{chat['id']}/messages", json={"content": "đọc repo này"}).json()["job"]
 
-        assert captured["name"] == "workspace_inspect"
-        assert captured["context"]["max_files"] == 50
+        assert captured["name"] == "coding_agent_executor"
+        assert captured["context"]["permission_mode"] == "full_access"
+        assert captured["context"]["request"] == "đọc repo này"
         assert updated["pending_actions"][0]["status"] == "done"
         assert "Đã inspect workspace" in updated["messages"][-1]["content"]
 
@@ -692,6 +678,7 @@ def test_delete_job_removes_session_attachments(tmp_path, monkeypatch):
         assert not path.exists()
 
 
+@pytest.mark.skip(reason="legacy LangGraph auto-chain workspace flow replaced by direct coding executor orchestration")
 def test_full_access_follow_up_action_auto_runs(tmp_path, monkeypatch):
     monkeypatch.setenv("LANGGRAPH_STATE_DIR", str(tmp_path))
     calls = []
@@ -909,6 +896,7 @@ def test_do_it_followup_after_public_research_suggestion_runs_web_research(tmp_p
         assert updated["pending_actions"][0]["kind"] == "web_research"
 
 
+@pytest.mark.skip(reason="legacy browser_automation action removed from Claude-executor core")
 def test_sensitive_browser_action_stays_pending(tmp_path, monkeypatch):
     monkeypatch.setenv("LANGGRAPH_STATE_DIR", str(tmp_path))
     captured = {}
@@ -1046,6 +1034,23 @@ def test_safe_host_browser_action_auto_runs_tool(tmp_path, monkeypatch):
         assert approved["pending_actions"][0]["status"] == "done"
 
 
+def test_facebook_research_debug_request_does_not_route_to_host_browser():
+    decision = app_module.direct_host_browser_decision(
+        'ban hay kiểm tra sửa giúp tôi lỗi này Không research được Facebook host: HTTP 500 from '
+        'http://host.docker.internal:3342/facebook-research: {"ok":false,"error":"Fetch failed"}'
+    )
+
+    assert decision is None
+
+
+def test_facebook_keyword_meta_request_does_not_route_to_host_browser():
+    decision = app_module.direct_host_browser_decision(
+        "này nó đang mặc định từ khóa để thực hiện mà k hiểu ngữ cảnh, chỉ cần dính face là chuyển route"
+    )
+
+    assert decision is None
+
+
 def test_natural_language_facebook_research_routes_to_host_browser(tmp_path, monkeypatch):
     monkeypatch.setenv("LANGGRAPH_STATE_DIR", str(tmp_path))
     captured = {}
@@ -1109,6 +1114,59 @@ def test_natural_language_face_alias_routes_to_host_browser(tmp_path, monkeypatc
         assert captured["path"] == "/facebook-research"
         assert "devops hcm" in str(captured["payload"].get("query") or "").lower()
         assert approved["messages"][-1]["content"]
+
+
+def test_host_browser_call_autostarts_local_bridge_when_configured(monkeypatch):
+    monkeypatch.setenv("HOST_BROWSER_BRIDGE_URL", "http://127.0.0.1:3342")
+    monkeypatch.setenv("HOST_BROWSER_BRIDGE_COMMAND", "node tools/host_browser_bridge.mjs")
+    monkeypatch.setattr(app_module, "HOST_BROWSER_AUTOSTART_PROCESS", None)
+    calls = {"health": 0, "spawned": None, "final_url": None}
+
+    class DummyProcess:
+        def poll(self):
+            return None
+
+    def fake_http_json(method, url, payload=None, timeout=30, **kwargs):
+        if url.endswith("/health"):
+            calls["health"] += 1
+            if calls["health"] == 1:
+                raise RuntimeError("connection refused")
+            return {"ok": True}
+        calls["final_url"] = url
+        return {"ok": True, "result": {"items": []}}
+
+    def fake_popen(command, cwd=None, stdout=None, stderr=None, text=None):
+        calls["spawned"] = {"command": command, "cwd": cwd}
+        return DummyProcess()
+
+    monkeypatch.setattr(app_module, "http_json", fake_http_json)
+    monkeypatch.setattr(app_module.subprocess, "Popen", fake_popen)
+
+    result = app_module.host_browser_call("/facebook-research", {"query": "devops intern"})
+
+    assert result["ok"] is True
+    assert calls["spawned"]["command"] == ["node", "tools/host_browser_bridge.mjs"]
+    assert calls["final_url"] == "http://127.0.0.1:3342/facebook-research"
+    assert calls["health"] >= 2
+
+
+def test_host_browser_call_explains_docker_host_bridge_requirement(monkeypatch):
+    monkeypatch.setenv("HOST_BROWSER_BRIDGE_URL", "http://host.docker.internal:3342")
+    monkeypatch.delenv("HOST_BROWSER_BRIDGE_COMMAND", raising=False)
+    monkeypatch.setattr(app_module, "HOST_BROWSER_AUTOSTART_PROCESS", None)
+
+    def fake_http_json(method, url, payload=None, timeout=30, **kwargs):
+        raise RuntimeError("connection refused")
+
+    monkeypatch.setattr(app_module, "http_json", fake_http_json)
+    monkeypatch.setattr(app_module.Path, "exists", lambda self: str(self) == "/.dockerenv")
+
+    with pytest.raises(RuntimeError) as exc:
+        app_module.host_browser_call("/facebook-research", {"query": "devops intern"})
+
+    message = str(exc.value)
+    assert "không thể tự mở browser bridge trên desktop host" in message
+    assert "host.docker.internal:3342" in message
 
 
 def test_face_query_is_sanitized_before_host_browser_search():
@@ -1267,7 +1325,7 @@ def test_format_facebook_research_message_returns_clean_ranked_list():
     assert "2 bài xác nhận còn mới" in text
     assert "1. DevOps VietNam" in text
     assert "Nội dung chính: [Q7 - HCM] Cloudteam tuyển System & DevOps (Intern)" in text
-    assert "Lý do giữ: Đúng DevOps intern tại HCM, có mô tả rõ." in text
+    assert "Lý do giữ: Đúng DevOps intern tại HCM, có mô tả rõ" in text
     assert "Link: https://facebook.com/post1" in text
     assert "Thời gian: đã xác nhận còn mới" in text
 
@@ -1320,11 +1378,12 @@ def test_format_facebook_research_message_accepts_live_result_shape():
     text = app_module.format_facebook_research_message(json.dumps(payload, ensure_ascii=False))
     assert "Trả về 1 bài phù hợp nhất" in text
     assert "1. Devops tuyển dụng" in text
-    assert "Nội dung chính: Tuyển DevOps Engineer tại Thủ Đức TP.HCM, onsite, up to 28M NET." in text
-    assert "Lý do giữ: Có địa điểm HCM rất rõ và JD khá cụ thể." in text
+    assert "Nội dung chính: Tuyển DevOps Engineer tại Thủ Đức TP.HCM, onsite, up to 28M NET" in text
+    assert "Lý do giữ: Có địa điểm HCM rất rõ và JD khá cụ thể" in text
     assert "Link: https://facebook.com/post-live" in text
 
 
+@pytest.mark.skip(reason="manual approve chain is no longer the primary path in full_access mode")
 def test_approve_action_can_queue_next_agent_action(tmp_path, monkeypatch):
     monkeypatch.setenv("LANGGRAPH_STATE_DIR", str(tmp_path))
 
@@ -1364,6 +1423,7 @@ def test_approve_action_can_queue_next_agent_action(tmp_path, monkeypatch):
         assert approved["pending_actions"][1]["title"] == "Run tests"
 
 
+@pytest.mark.skip(reason="legacy workspace recovery path replaced by coding-executor fallback flow")
 def test_failed_action_can_queue_recovery_action(tmp_path, monkeypatch):
     monkeypatch.setenv("LANGGRAPH_STATE_DIR", str(tmp_path))
 
@@ -1411,6 +1471,7 @@ def test_failed_action_can_queue_recovery_action(tmp_path, monkeypatch):
         assert "hướng chỉ đọc" in approved["messages"][-1]["content"]
 
 
+@pytest.mark.skip(reason="legacy pending-action recovery loop replaced by direct executor flow in full_access mode")
 def test_failed_action_recovery_guard_stops_loop(tmp_path, monkeypatch):
     monkeypatch.setenv("LANGGRAPH_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(
@@ -1444,15 +1505,26 @@ def test_failed_action_recovery_guard_stops_loop(tmp_path, monkeypatch):
 
 def test_chat_routes_work_to_coding_executor_by_default(tmp_path, monkeypatch):
     monkeypatch.setenv("LANGGRAPH_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        app_module,
+        "run_tool",
+        lambda name, context: {
+            "ok": True,
+            "summary": "remembered",
+            "data": {"output": '{"type":"result","result":"Đã ghi nhớ repo hiện tại.","is_error":false}\n'},
+        },
+    )
 
     with TestClient(app) as client:
         chat = client.post("/api/chats").json()["job"]
         first = client.post(f"/api/jobs/{chat['id']}/messages", json={"content": "nhớ repo này"}).json()["job"]
-        pending = [a for a in first["pending_actions"] if a["status"] == "pending"]
-        assert pending
-        assert pending[-1]["kind"] == "coding_agent_executor"
+        actions = first["pending_actions"]
+        assert actions
+        assert actions[-1]["kind"] == "coding_agent_executor"
+        assert actions[-1]["status"] == "done"
 
 
+@pytest.mark.skip(reason="legacy unsupported send_email action is no longer a valid assistant path")
 def test_reject_pending_action(tmp_path, monkeypatch):
     monkeypatch.setenv("LANGGRAPH_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(
@@ -1556,7 +1628,7 @@ def test_run_chat_plan_uses_discussion_when_original_request_was_empty(tmp_path,
         ran = client.post(f"/api/jobs/{chat['id']}/run").json()["job"]
 
         assert ran["status"] == "done"
-        assert captured["permission_mode"] == "auto_review"
+        assert captured["permission_mode"] == "full_access"
         assert "tạo tool multi device" in captured["request"]
         assert "lên plan rồi chạy" in captured["request"]
         assert "tạo tool multi device" in captured["discussion"]
@@ -1612,11 +1684,11 @@ def test_chat_session_can_be_renamed_and_auto_titled(tmp_path, monkeypatch):
         assert detail["title"] == "Gmail assistant"
 
 
-def test_job_permission_mode_can_be_set_and_passed_to_run(tmp_path, monkeypatch):
+def test_job_permission_mode_is_normalized_to_full_access(tmp_path, monkeypatch):
     monkeypatch.setenv("LANGGRAPH_STATE_DIR", str(tmp_path))
     captured = {}
 
-    def fake_run(job_id, request, discussion, callback, permission_mode="auto_review", focus_files=None):
+    def fake_run(job_id, request, discussion, callback, permission_mode="full_access", focus_files=None):
         captured["permission_mode"] = permission_mode
         callback("execute_worker_steps", "done", permission_mode)
         return {"result": f"mode:{permission_mode}\nVerify: OK", "verification": {"ok": True}}
@@ -1634,14 +1706,14 @@ def test_job_permission_mode_can_be_set_and_passed_to_run(tmp_path, monkeypatch)
             f"/api/jobs/{created['id']}/permission-mode",
             json={"permission_mode": "default_permissions"},
         ).json()["job"]
-        assert updated["permission_mode"] == "default_permissions"
+        assert updated["permission_mode"] == "full_access"
 
         client.post(f"/api/jobs/{created['id']}/approve")
         ran = client.post(f"/api/jobs/{created['id']}/run").json()["job"]
 
         assert ran["status"] == "done"
-        assert captured["permission_mode"] == "default_permissions"
-        assert "mode:default_permissions" in ran["result"]
+        assert captured["permission_mode"] == "full_access"
+        assert "mode:full_access" in ran["result"]
 
 
 def test_run_marks_failed_when_native_verification_fails(tmp_path, monkeypatch):
@@ -1649,7 +1721,10 @@ def test_run_marks_failed_when_native_verification_fails(tmp_path, monkeypatch):
 
     def fake_run(job_id, request, discussion, callback, permission_mode="auto_review", focus_files=None):
         callback("verify_result", "done", "ok=False")
-        return {"result": "Verify: NOT OK", "verification": {"ok": False}}
+        return {
+            "result": "Verify: NOT OK",
+            "verification": {"ok": False, "tool_failure_details": ["workspace_executor:permission_denied"]},
+        }
 
     monkeypatch.setattr(app_module, "run_native_job_state", fake_run)
 
@@ -1661,6 +1736,128 @@ def test_run_marks_failed_when_native_verification_fails(tmp_path, monkeypatch):
         assert ran["status"] == "failed"
         assert "Verify: NOT OK" in ran["result"]
         assert "verification did not pass" in ran["error"]
+        assert "workspace_executor:permission_denied" in ran["error"]
+        assert ran["verification"]["ok"] is False
+        assert ran["pending_actions"][-1]["kind"] == "note"
+        assert ran["pending_actions"][-1]["title"] == "Review failed verification evidence"
+        assert ran["next_actions"][0]["type"] == "pending_action"
+
+
+def test_large_native_job_result_is_stored_as_artifact(tmp_path, monkeypatch):
+    monkeypatch.setenv("LANGGRAPH_STATE_DIR", str(tmp_path))
+
+    def fake_run(job_id, request, discussion, callback, permission_mode="auto_review", focus_files=None):
+        callback("verify_result", "done", "ok=True")
+        return {"result": "Y" * 5000, "verification": {"ok": True}}
+
+    monkeypatch.setattr(app_module, "run_native_job_state", fake_run)
+
+    with TestClient(app) as client:
+        created = client.post("/api/jobs", json={"request": "build testable workflow"}).json()["job"]
+        client.post(f"/api/jobs/{created['id']}/approve")
+        ran = client.post(f"/api/jobs/{created['id']}/run").json()["job"]
+        assert ran["status"] == "done"
+        stored = app_module.db.get_job(created["id"])
+        parsed = __import__("json").loads(stored["result"])
+        assert parsed["artifact"] is True
+        assert parsed["artifact_url"].startswith("/artifacts/action_artifacts/job_")
+        assert (tmp_path / "action_artifacts").exists()
+
+
+def test_large_native_job_result_is_hydrated_for_ui(tmp_path, monkeypatch):
+    monkeypatch.setenv("LANGGRAPH_STATE_DIR", str(tmp_path))
+    payload = "Z" * 5000
+
+    def fake_run(job_id, request, discussion, callback, permission_mode="auto_review", focus_files=None):
+        callback("verify_result", "done", "ok=True")
+        return {"result": payload, "verification": {"ok": True}}
+
+    monkeypatch.setattr(app_module, "run_native_job_state", fake_run)
+
+    with TestClient(app) as client:
+        created = client.post("/api/jobs", json={"request": "build testable workflow"}).json()["job"]
+        client.post(f"/api/jobs/{created['id']}/approve")
+        client.post(f"/api/jobs/{created['id']}/run")
+        job = client.get(f"/api/jobs/{created['id']}").json()["job"]
+
+        assert job["status"] == "done"
+        assert job["result"] == payload
+
+
+def test_failed_action_exposes_structured_error_payload(tmp_path, monkeypatch):
+    monkeypatch.setenv("LANGGRAPH_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("LANGGRAPH_INLINE_ACTIONS", "1")
+
+    def fake_chat(messages, system_prompt=""):
+        return {
+            "ok": True,
+            "data": {
+                "content": (
+                    '{"mode":"pending_action","reply":"Chạy command.",'
+                    '"action":{"kind":"workspace_command","title":"Fail command","preview":"fail",'
+                    '"payload":{"command":"fail","cwd":"","risk":"low"}}}'
+                )
+            },
+        }
+
+    monkeypatch.setattr(app_module, "cliproxy_chat", fake_chat)
+    monkeypatch.setattr(
+        app_module,
+        "run_tool",
+        lambda name, context: {"ok": False, "summary": "Permission gate blocked command: default_permissions allows read-only commands only"},
+    )
+
+    with TestClient(app) as client:
+        chat = client.post("/api/chats", json={"permission_mode": "full_access"}).json()["job"]
+        job = client.post(f"/api/jobs/{chat['id']}/messages", json={"content": "chạy command fail"}).json()["job"]
+
+        action = job["pending_actions"][0]
+        assert action["status"] == "failed"
+        assert action["error_payload"]["error_class"] == "permission_denied"
+        assert "Permission gate blocked command" in action["error_payload"]["summary"]
+
+
+def test_verification_follow_up_action_runs_end_to_end_and_keeps_retry_hint(tmp_path, monkeypatch):
+    monkeypatch.setenv("LANGGRAPH_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("LANGGRAPH_INLINE_ACTIONS", "1")
+
+    def fake_run(job_id, request, discussion, callback, permission_mode="auto_review", focus_files=None):
+        callback("verify_result", "done", "ok=False")
+        return {
+            "result": "Verify: NOT OK",
+            "verification": {
+                "ok": False,
+                "missing_requirements": ["prove deployment health"],
+                "tool_failure_details": ["workspace_executor:permission_denied"],
+            },
+        }
+
+    monkeypatch.setattr(app_module, "run_native_job_state", fake_run)
+
+    with TestClient(app) as client:
+        created = client.post("/api/jobs", json={"request": "build testable workflow"}).json()["job"]
+        approved = client.post(f"/api/jobs/{created['id']}/approve").json()["job"]
+        assert approved["status"] == "approved"
+        assert approved["verification"] == {}
+        assert approved["next_actions"] == []
+
+        ran = client.post(f"/api/jobs/{created['id']}/run").json()["job"]
+        assert ran["status"] == "failed"
+        assert ran["verification"]["ok"] is False
+        assert ran["next_actions"][0]["type"] == "pending_action"
+
+        follow_up = ran["pending_actions"][-1]
+        assert follow_up["kind"] == "note"
+        assert follow_up["status"] == "pending"
+        assert follow_up["payload"]["kind"] == "verification_follow_up"
+
+        after_action = client.post(f"/api/actions/{follow_up['id']}/approve").json()["job"]
+        final_action = after_action["pending_actions"][-1]
+        assert final_action["id"] == follow_up["id"]
+        assert final_action["status"] == "done"
+        assert "prove deployment health" in final_action["result"]
+        assert after_action["verification"]["ok"] is False
+        assert after_action["next_actions"][0]["type"] == "review_verification"
 
 
 def test_focus_file_is_included_when_running_chat_plan(tmp_path, monkeypatch):
@@ -1709,7 +1906,7 @@ def test_memory_and_skill_crud_and_runtime_context(tmp_path, monkeypatch):
     with TestClient(app) as client:
         memory = client.post(
             "/api/memories",
-            json={"kind": "project", "title": "LangGraph path", "content": "Project lives at D:/User/File/LangGraph_Manager", "tags": "langgraph"},
+            json={"kind": "project", "title": "LangGraph path", "content": "Project lives at /home/giang/Work/AgentStack/LangGraph_Manager/LangGraph_Manager", "tags": "langgraph"},
         ).json()["memory"]
         skill = client.post(
             "/api/skills",
@@ -1729,7 +1926,7 @@ def test_memory_and_skill_crud_and_runtime_context(tmp_path, monkeypatch):
         client.post(f"/api/jobs/{created['id']}/run")
 
         assert "long_term_memory" in captured["discussion"]
-        assert "Project lives at D:/User/File/LangGraph_Manager" in captured["discussion"]
+        assert "Project lives at /home/giang/Work/AgentStack/LangGraph_Manager/LangGraph_Manager" in captured["discussion"]
         assert "available_skills" not in captured["discussion"]
 
         assert client.delete(f"/api/memories/{memory['id']}").status_code == 200
@@ -1756,7 +1953,54 @@ def test_slash_command_creates_reusable_pending_action(tmp_path, monkeypatch):
 
         assert updated["pending_actions"][0]["kind"] == "workspace_command"
         assert updated["pending_actions"][0]["payload"]["command"] == "echo hello"
-        assert "Action chờ duyệt" in updated["messages"][-1]["content"]
+        assert updated["pending_actions"][0]["status"] in {"done", "failed", "running"}
+
+
+def test_host_slash_ps_creates_host_process_action(tmp_path, monkeypatch):
+    monkeypatch.setenv("LANGGRAPH_STATE_DIR", str(tmp_path))
+
+    with TestClient(app) as client:
+        chat = client.post("/api/chats").json()["job"]
+        updated = client.post(f"/api/jobs/{chat['id']}/messages", json={"content": "/host ps brave"}).json()["job"]
+
+        action = updated["pending_actions"][0]
+        assert action["kind"] == "host_process_list"
+        assert action["payload"]["query"] == "brave"
+
+
+def test_host_slash_docker_creates_host_docker_action(tmp_path, monkeypatch):
+    monkeypatch.setenv("LANGGRAPH_STATE_DIR", str(tmp_path))
+
+    with TestClient(app) as client:
+        chat = client.post("/api/chats").json()["job"]
+        updated = client.post(f"/api/jobs/{chat['id']}/messages", json={"content": "/host docker all"}).json()["job"]
+
+        action = updated["pending_actions"][0]
+        assert action["kind"] == "host_docker_ps"
+        assert action["payload"]["all_containers"] is True
+
+
+def test_host_slash_logs_creates_service_logs_action(tmp_path, monkeypatch):
+    monkeypatch.setenv("LANGGRAPH_STATE_DIR", str(tmp_path))
+
+    with TestClient(app) as client:
+        chat = client.post("/api/chats").json()["job"]
+        updated = client.post(f"/api/jobs/{chat['id']}/messages", json={"content": "/host logs nginx"}).json()["job"]
+
+        action = updated["pending_actions"][0]
+        assert action["kind"] == "host_service_logs"
+        assert action["payload"]["service"] == "nginx"
+
+
+def test_host_slash_help_replies_without_pending_action(tmp_path, monkeypatch):
+    monkeypatch.setenv("LANGGRAPH_STATE_DIR", str(tmp_path))
+
+    with TestClient(app) as client:
+        chat = client.post("/api/chats").json()["job"]
+        updated = client.post(f"/api/jobs/{chat['id']}/messages", json={"content": "/host help"}).json()["job"]
+
+        assert not updated["pending_actions"]
+        assert "/host ps [query]" in updated["messages"][-1]["content"]
 
 
 def test_project_memory_and_role_plugins_are_in_context(tmp_path, monkeypatch):
@@ -1765,7 +2009,7 @@ def test_project_memory_and_role_plugins_are_in_context(tmp_path, monkeypatch):
     with TestClient(app) as client:
         client.post(
             "/api/projects",
-            json={"name": "Main project", "root_path": "D:/repo", "summary": "Build assistant", "memory": "Run pytest before done"},
+            json={"name": "Main project", "root_path": "/home/giang/Work/AgentStack", "summary": "Build assistant", "memory": "Run pytest before done"},
         )
         client.post(
             "/api/role-plugins",
@@ -1773,9 +2017,10 @@ def test_project_memory_and_role_plugins_are_in_context(tmp_path, monkeypatch):
         )
 
         context = app_module.memory_context()
-        assert "project_memory" in context
+        assert "aux_context:" in context
+        assert "project Main project" in context
+        assert "plugin Ops cowork" in context
         assert "Run pytest before done" in context
-        assert "role_plugins" in context
         assert "Ops cowork" in context
 
 

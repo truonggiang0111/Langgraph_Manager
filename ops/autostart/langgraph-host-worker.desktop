@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=LangGraph Host Worker
+Comment=Start LangGraph host worker on login
+Exec=/usr/bin/env node /home/giang/Work/AgentStack/LangGraph_Manager/LangGraph_Manager/tools/host_browser_bridge.mjs
+Path=/home/giang/Work/AgentStack/LangGraph_Manager/LangGraph_Manager
+Terminal=false
+X-GNOME-Autostart-enabled=true

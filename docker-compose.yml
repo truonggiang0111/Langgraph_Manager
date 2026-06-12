@@ -8,24 +8,25 @@ services:
     environment:
       LANGGRAPH_MANAGER_ENV: local
       LANGGRAPH_STATE_DIR: /data/state
-      LANGGRAPH_WORKSPACE_ROOT: /workspace/LangGraph_Manager
+      LANGGRAPH_WORKSPACE_ROOT: /workspace/LangGraph_Manager/LangGraph_Manager
       CLAUDE_HOME_PATH: /claude-home
       CLAUDE_EXECUTOR_HOME_PATH: /home/node/.claude
       CODEGRAPH_ENABLED: 1
       LANGGRAPH_PYTHON: python
       LANGGRAPH_UI_URL: http://host.docker.internal:8899/api/health
       LANGGRAPH_PUBLIC_URL: https://langgraph.clawflow.shop
-      HOST_BROWSER_BRIDGE_URL: http://10.5.0.2:3342
+      HOST_BROWSER_BRIDGE_URL: http://host.docker.internal:3342
       CLIPROXY_BASE_URL: http://host.docker.internal:8317
-      CLIPROXY_MODEL: gpt-5.4
-      CLIPROXY_CHAT_MODEL: gpt-5.4
+      CLIPROXY_API_KEY: sk-0286638620c8cb61-j6tphi-721bc272
+      CLIPROXY_MODEL: gpt-5.5
+      CLIPROXY_CHAT_MODEL: gpt-5.5
       CLIPROXY_PLAN_MODEL: gpt-5.5
       CLIPROXY_CHAT_MAX_TOKENS: 700
       CLIPROXY_MANAGEMENT_PASSWORD: codex-test
       CLIPROXY_STREAM_TIMEOUT_SECONDS: 20
-      CLAUDE_EXECUTOR_COMMAND: docker run --rm -i --entrypoint /usr/local/bin/claude-executor-entrypoint --user node --group-add 0 --add-host host.docker.internal:host-gateway -e HOME=/home/node -e NPM_CONFIG_CACHE=/home/node/.npm -e SSH_SOURCE_DIR=/ssh-host -e ANTHROPIC_BASE_URL=http://host.docker.internal:8082 -e ANTHROPIC_AUTH_TOKEN=freecc -e ANTHROPIC_API_KEY=freecc -e CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1 -e GIT_SSH_COMMAND=ssh -v /var/run/docker.sock:/var/run/docker.sock -v D:/User/File:/workspace -v D:/User/File/ClaudeHome:/home/node/.claude -v D:/User/File/ClaudeHome/.claude.json:/home/node/.claude.json -v C:/Users/giang/.ssh:/ssh-host:ro -w /workspace/LangGraph_Manager claude-executor-mcp:local -p --model gpt-5.4 --permission-mode bypassPermissions --tools default --add-dir /workspace --add-dir /workspace/LangGraph_Manager --output-format text
+      CLAUDE_EXECUTOR_COMMAND: docker run --rm -i --entrypoint /usr/local/bin/claude-executor-entrypoint --user node --group-add 0 --add-host host.docker.internal:host-gateway -e HOME=/home/node -e CLAUDE_CONFIG_DIR=/home/node/.claude -e NPM_CONFIG_CACHE=/home/node/.npm -e SSH_SOURCE_DIR=/ssh-host -e ANTHROPIC_BASE_URL=http://host.docker.internal:8082 -e ANTHROPIC_AUTH_TOKEN=freecc -e ANTHROPIC_API_KEY=freecc -e CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1 -e GIT_SSH_COMMAND=ssh -v /var/run/docker.sock:/var/run/docker.sock -v /home/giang/Work/AgentStack:/workspace -v /home/giang/Work/AgentStack/ClaudeHome/ClaudeHome:/home/node/.claude -v /home/giang/Work/AgentStack/ClaudeHome/ClaudeHome/.claude.json:/home/node/.claude.json -v /home/giang/.ssh:/ssh-host:ro -w /workspace/LangGraph_Manager/LangGraph_Manager claude-executor-mcp:local -p --model gpt-5.5 --permission-mode bypassPermissions --tools default --add-dir /workspace --add-dir /workspace/LangGraph_Manager/LangGraph_Manager --output-format text
       CLAUDE_EXECUTOR_TIMEOUT: 900
-      CUT_VIDEO_BRIDGE_URL: http://host.docker.internal:3337
+      CUT_VIDEO_BRIDGE_URL: http://cut-video-host-bridge:3337
       N8N_BASE_URL: http://host.docker.internal:5678
       OPENCLAW_HOOK_URL: http://host.docker.internal:18789/hooks/agent
     ports:
@@ -33,6 +34,48 @@ services:
     volumes:
       - ./src:/app/src
       - ./data:/data/state
-      - D:/User/File:/workspace
-      - D:/User/File/ClaudeHome:/claude-home:ro
+      - /home/giang/Work/AgentStack:/workspace
+      - /home/giang/Work/AgentStack/ClaudeHome/ClaudeHome:/claude-home:ro
       - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      - cut-video-host-bridge
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  cut-video-host-bridge:
+    image: docker:28-cli
+    container_name: cut-video-host-bridge
+    restart: unless-stopped
+    working_dir: /home/giang/Work/AgentStack/n8n/n8n/tiktok-japanese-render
+    environment:
+      CUT_VIDEO_BRIDGE_HOST: 0.0.0.0
+      CUT_VIDEO_BRIDGE_PORT: 3337
+      CUT_VIDEO_BRIDGE_TOKEN: ""
+      CUT_VIDEO_ROOT: /home/giang/Work/Imported/2026-06-devops-migration/projects/Cut_video
+      CUT_VIDEO_COMPOSE_FILES: docker-compose.yml:/home/giang/Work/Imported/2026-06-devops-migration/projects/Cut_video/docker-compose.linux.yml
+      CUT_VIDEO_INBOX: /home/giang/Work/Imported/2026-06-devops-migration/projects/Cut_video/runtime/inbox/tiktok_downloads
+      CUT_VIDEO_REPORTS: /home/giang/Work/Imported/2026-06-devops-migration/projects/Cut_video/runtime/reports/cut_video
+      CUT_VIDEO_ICLOUD_READY_DOCKER: /data/icloud_ready/CutVideo/Ready
+      CUT_VIDEO_LLM_BACKEND: cliproxy
+      CLIPROXY_BASE_URL: http://host.docker.internal:8317
+      CLIPROXY_API_KEY: sk-0286638620c8cb61-j6tphi-721bc272
+      CLIPROXY_MODEL: gpt-5.5
+      CUT_VIDEO_STEP_TIMEOUT_MS: 5400000
+      CUT_VIDEO_LLM_TIMEOUT_MS: 300000
+    command:
+      - sh
+      - -lc
+      - |
+        apk add --no-cache nodejs >/dev/null
+        mkdir -p \
+          /home/giang/Work/Imported/2026-06-devops-migration/projects/Cut_video/runtime/inbox/tiktok_downloads \
+          /home/giang/Work/Imported/2026-06-devops-migration/projects/Cut_video/runtime/reports/cut_video \
+          /home/giang/Work/Imported/2026-06-devops-migration/projects/Cut_video/runtime/scratch \
+          /home/giang/Work/Imported/2026-06-devops-migration/projects/Cut_video/runtime/icloud_ready/CutVideo/Ready
+        exec node ./cut-video-host-bridge.mjs
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /home/giang/Work/AgentStack/n8n/n8n/tiktok-japanese-render:/home/giang/Work/AgentStack/n8n/n8n/tiktok-japanese-render
+      - /home/giang/Work/Imported/2026-06-devops-migration/projects/Cut_video:/home/giang/Work/Imported/2026-06-devops-migration/projects/Cut_video
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

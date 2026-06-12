@@ -34,6 +34,8 @@ def test_unknown_tool_returns_structured_failure():
     result = run_tool("missing_tool", {})
     assert result["ok"] is False
     assert "Unknown tool" in result["summary"]
+    assert result["error_class"] == "unknown_tool"
+    assert result["evidence"]["has_data"] is False
 
 
 def test_plan_prompt_uses_plan_model(monkeypatch):
@@ -88,6 +90,7 @@ def test_workspace_executor_blocks_mutation_in_default_mode(tmp_path, monkeypatc
     )
     assert result["ok"] is False
     assert "blocked" in result["summary"]
+    assert result["error_class"] == "permission_denied"
     assert not (tmp_path / "should_not_exist").exists()
 
 
@@ -100,6 +103,8 @@ def test_workspace_executor_runs_read_only_command(tmp_path, monkeypatch):
     )
     assert result["ok"] is True
     assert "a.txt" in result["data"]["output"]
+    assert result["error_class"] == ""
+    assert result["evidence"]["has_output"] is True
 
 
 def test_coding_agent_executor_requires_configuration(tmp_path, monkeypatch):

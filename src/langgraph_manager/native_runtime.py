@@ -598,7 +598,7 @@ def execute_task_dag(state: NativeState, context: dict[str, Any]) -> list[dict[s
     tasks = [dict(task) for task in state.get("task_graph", [])]
     if not tasks:
         return []
-    callback = state.get("_callback")
+    callback = state.get("_callback") or CALLBACKS.get(str(state.get("_callback_key") or state.get("job_id") or ""))
     completed: set[str] = set()
     failed: set[str] = set()
     running: set[str] = set()
@@ -649,6 +649,11 @@ def verifier_node(state: NativeState) -> NativeState:
     task_graph = state.get("task_graph", [])
     task_failures = [r.get("id", "unknown") for r in state.get("task_results", []) if r.get("status") != "done"]
     tool_failures = [r.get("name", "unknown") for r in state.get("tool_results", []) if not r.get("ok")]
+    tool_failure_details = [
+        f"{r.get('name', 'unknown')}:{r.get('error_class') or 'runtime_error'}"
+        for r in state.get("tool_results", [])
+        if not r.get("ok")
+    ]
     executed_tools = {str(r.get("name", "")) for r in state.get("tool_results", []) if r.get("ok")}
     execution_tools_ok = state.get("intent") != "engineering" or bool(executed_tools & {"workspace_executor", "coding_agent_executor"})
     dispatch_ok = bool(state.get("worker_assignments"))
@@ -686,6 +691,7 @@ def verifier_node(state: NativeState) -> NativeState:
         "task_nodes": len(task_graph),
         "tool_calls": len(state.get("tool_results", [])),
         "tool_failures": tool_failures,
+        "tool_failure_details": tool_failure_details,
         "task_failures": task_failures,
         "execution_tools_ok": execution_tools_ok,
         "dispatch_ok": dispatch_ok,
@@ -731,6 +737,7 @@ def report_node(state: NativeState) -> NativeState:
             f"Verify detail: execution_tools_ok={verification.get('execution_tools_ok')}, dispatch_ok={verification.get('dispatch_ok')}, onboarding_tools_ok={verification.get('onboarding_tools_ok')}, evidence_ok={verification.get('evidence_ok')}, evidence_count={verification.get('evidence_count')}",
             f"Hard gate: {'OK' if verification.get('hard_gate_ok') else 'FAILED'}",
             f"Missing requirements: {', '.join(verification.get('missing_requirements') or []) or 'None'}",
+            f"Tool failure details: {', '.join(verification.get('tool_failure_details') or []) or 'None'}",
             "",
             "Anti-fake report evidence:",
             "- Report is marked OK only when required tools ran successfully and the verifier saw completed task/tool evidence.",

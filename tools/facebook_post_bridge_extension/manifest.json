@@ -1,0 +1,38 @@
+{
+  "manifest_version": 3,
+  "name": "Facebook Post Bridge",
+  "version": "0.1.0",
+  "description": "Extract visible Facebook post text, links, and image-heavy candidates for local research workflows.",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "https://www.facebook.com/*",
+    "https://m.facebook.com/*",
+    "http://127.0.0.1:3342/*",
+    "http://127.0.0.1:8899/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Facebook Post Bridge",
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.facebook.com/*",
+        "https://m.facebook.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}

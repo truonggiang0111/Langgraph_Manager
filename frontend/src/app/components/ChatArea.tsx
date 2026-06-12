@@ -12,6 +12,7 @@ interface ChatAreaProps {
 
 export function ChatArea({ messages, onSelectAction, onActionDecision, onReconfirmPlan }: ChatAreaProps) {
   const bottomRef = useRef<HTMLDivElement | null>(null);
+  const scrollAreaRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ block: 'end' });
@@ -32,7 +33,10 @@ export function ChatArea({ messages, onSelectAction, onActionDecision, onReconfi
   }
 
   return (
-    <ScrollArea className="min-h-0 flex-1 overflow-hidden rounded-t-2xl bg-background">
+    <ScrollArea
+      className="min-h-0 flex-1 overflow-hidden rounded-t-2xl bg-background"
+      viewportRef={scrollAreaRef}
+    >
       <div className="p-4 space-y-4 max-w-4xl mx-auto">
         {messages.map((message) => (
           <MessageBubble
